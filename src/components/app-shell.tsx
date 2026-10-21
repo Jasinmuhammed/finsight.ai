@@ -7,8 +7,8 @@ import { useEffect, useState } from "react";
 const navigation = [
   { label: "Dashboard", href: "/", icon: "▦", available: true },
   { label: "Stock screener", href: "/screener", icon: "⌕", available: true },
-  { label: "Stock analysis", icon: "⌁", available: false },
-  { label: "Charts & patterns", href: "/charts", icon: "◫", available: true },
+  { label: "Stock analysis", href: "/analysis", icon: "⌁", available: true },
+  { label: "Chart analysis", href: "/charts", icon: "◫", available: true },
   { label: "Backtesting", href: "/backtesting", icon: "↗", available: true },
   { label: "Portfolio & risk", href: "/portfolio", icon: "◉", available: true },
   { label: "Watchlists & alerts", href: "/watchlists", icon: "☆", available: true },
@@ -16,17 +16,46 @@ const navigation = [
   { label: "AI assistant", icon: "✳", available: false },
 ];
 
+type MarketDataStatus = {
+  provider: string;
+  status: string;
+  configured: boolean;
+  universe_configured?: boolean;
+};
+
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const pageLabel =
-    navigation.find((item) => item.href === pathname)?.label ?? "Dashboard";
+    navigation.find((item) => item.href === pathname)?.label ??
+    (pathname === "/login"
+      ? "Sign in"
+      : pathname === "/register"
+        ? "Create account"
+        : "Dashboard");
   const [email, setEmail] = useState<string | null>(null);
   const [accountError, setAccountError] = useState("");
+  const [marketDataStatus, setMarketDataStatus] = useState<MarketDataStatus | null>(null);
   const apiBase =
     process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
   useEffect(() => {
     const controller = new AbortController();
+    fetch(`${apiBase}/market-data/status`, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`Market-data status failed (${response.status}).`);
+        }
+        setMarketDataStatus((await response.json()) as MarketDataStatus);
+      })
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name !== "AbortError") {
+          setMarketDataStatus({
+            provider: "unavailable",
+            status: "UNAVAILABLE",
+            configured: false,
+          });
+        }
+      });
     fetch(`${apiBase}/auth/me`, {
       credentials: "include",
       signal: controller.signal,
@@ -98,10 +127,20 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <div className="data-mode"><span /> Illustrative demo data</div>
+          <div className={`data-mode ${marketDataStatus?.configured ? "data-mode-historical" : ""}`}>
+            <span />
+            {marketDataStatus?.configured
+              ? `Historical data · ${marketDataStatus.provider}`
+              : marketDataStatus
+                ? "Historical data unavailable"
+                : "Checking data source"}
+          </div>
           <div className="profile">
-            <div className="avatar">D</div>
-            <div><strong>Demo workspace</strong><small>Local preview</small></div>
+            <div className="avatar">{email?.[0]?.toUpperCase() ?? "F"}</div>
+            <div>
+              <strong>{email ?? "FinSight workspace"}</strong>
+              <small>{email ? "Signed in" : "Sign in for private data"}</small>
+            </div>
           </div>
         </div>
       </aside>
@@ -109,7 +148,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <header className="topbar">
           <span className="breadcrumb">Workspace <span>/</span> {pageLabel}</span>
           <div className="topbar-right">
-            <span className="market-pill"><span /> Market data: demo</span>
+            <span
+              className={`market-pill ${marketDataStatus?.configured ? "historical" : ""}`}
+              title="Daily historical data is not a live quote."
+            >
+              <span />
+              {!marketDataStatus
+                ? "Checking data source"
+                : marketDataStatus.configured
+                  ? `Historical data · ${marketDataStatus.provider}`
+                  : "Market data unavailable"}
+            </span>
             {email ? (
               <button className="account-button" onClick={() => void signOut()} type="button">
                 {email} · Sign out

@@ -135,7 +135,7 @@ export function BacktestWorkspace() {
           <div><p className="eyebrow">SIMULATION CONFIGURATION</p><h2>Set strategy and assumptions</h2></div>
           <span className="demo-tag historical-tag">DAILY HISTORICAL DATA</span>
         </div>
-        <p className="data-provenance">Runs only on user-supplied CSV candles. A signal at a daily close is filled at the next available daily open. No simulated market prices are used.</p>
+        <p className="data-provenance">Runs only on configured daily historical candles; results are not live prices or predictions. A signal at a daily close is filled at the next available daily open. No simulated market prices are used.</p>
         <form className="backtest-form" onSubmit={run}>
           <label className="field"><span>Symbol</span><input maxLength={32} onChange={(event) => setSymbol(event.target.value)} placeholder="e.g. RELIANCE" required value={symbol} /></label>
           <label className="field"><span>Exchange</span><select onChange={(event) => setExchange(event.target.value)} value={exchange}><option value="NSE">NSE</option><option value="BSE">BSE</option></select></label>

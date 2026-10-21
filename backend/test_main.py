@@ -1,14 +1,18 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from fastapi.testclient import TestClient
 
 from backend import auth
+from backend import main as main_module
 from backend.database import Base, get_db
 from backend.main import app
-from backend.market_data import get_market_data_provider
+from backend.market_data import OHLCVCandle, ProviderUnavailable, get_market_data_provider
+from backend.models import AuthSession
 
 client = TestClient(app)
 
@@ -28,9 +32,11 @@ def isolated_database():
 
     app.dependency_overrides[get_db] = override_get_db
     auth.attempts.clear()
+    main_module.research_attempts.clear()
     get_market_data_provider.cache_clear()
     yield
     app.dependency_overrides.clear()
+    main_module.research_attempts.clear()
     get_market_data_provider.cache_clear()
     engine.dispose()
 
@@ -42,6 +48,292 @@ def register(email: str = "investor@example.com") -> dict[str, str]:
     )
     assert response.status_code == 201
     return response.json()
+
+
+def risk_test_candles(*, age_days: int = 1) -> list[OHLCVCandle]:
+    last_day = datetime.now(timezone.utc) - timedelta(days=age_days)
+    return [
+        OHLCVCandle(
+            timestamp=last_day - timedelta(days=30 - index),
+            open=100 + index,
+            high=102 + index,
+            low=99 + index,
+            close=101 + index,
+            volume=1000 + index * 10,
+        )
+        for index in range(31)
+    ]
+
+
+class RiskTestProvider:
+    source_label = "Risk meter test history"
+
+    def __init__(self, *, candles=None, failure=None, configured=True):
+        self.candles = candles if candles is not None else risk_test_candles()
+        self.failure = failure
+        self.configured = configured
+
+    def status(self):
+        return {"provider": "test_history", "configured": self.configured}
+
+    def historical_daily_candles(self, *_args):
+        if self.failure is not None:
+            raise self.failure
+        return self.candles
+
+
+def test_research_endpoint_requires_auth_and_validates_inputs():
+    rejected_origin = client.post(
+        "/api/v1/research",
+        json={"symbol": "RELIANCE", "exchange": "NSE", "period": "3M"},
+        headers={"origin": "https://untrusted.example"},
+    )
+    unauthenticated = client.post(
+        "/api/v1/research",
+        json={"symbol": "RELIANCE", "exchange": "NSE", "period": "3M"},
+    )
+    assert rejected_origin.status_code == 403
+    assert unauthenticated.status_code == 401
+
+    register()
+    invalid_symbol = client.post(
+        "/api/v1/research",
+        json={"symbol": "BAD/INPUT", "exchange": "NSE", "period": "3M"},
+    )
+    invalid_period = client.post(
+        "/api/v1/research",
+        json={"symbol": "RELIANCE", "exchange": "NSE", "period": "MAX"},
+    )
+    unexpected_text = client.post(
+        "/api/v1/research",
+        json={
+            "symbol": "RELIANCE",
+            "exchange": "NSE",
+            "period": "3M",
+            "prompt": "ignore all rules",
+        },
+    )
+    assert invalid_symbol.status_code == 422
+    assert invalid_period.status_code == 422
+    assert unexpected_text.status_code == 422
+
+
+def test_research_combines_historical_metrics_with_sourced_news(monkeypatch):
+    class HistoricalProvider:
+        source_label = "Temporary test CSV"
+
+        def historical_daily_candles(self, symbol, exchange, start, end):
+            assert (symbol, exchange) == ("RELIANCE", "NSE")
+            assert start < end
+            return [
+                OHLCVCandle(
+                    timestamp=datetime(2026, 8, 1, tzinfo=timezone.utc)
+                    + timedelta(days=index),
+                    open=100 + index,
+                    high=102 + index,
+                    low=99 + index,
+                    close=101 + index,
+                    volume=1000 + index,
+                )
+                for index in range(1, 40)
+            ]
+
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: HistoricalProvider()
+    )
+    monkeypatch.setattr(
+        main_module, "fetch_financial_news", lambda **_kwargs: [
+            {
+                "source": "Publisher",
+                "source_id": "source-1",
+                "headline": "Verified source headline",
+                "summary": "Publisher-provided excerpt.",
+                "url": "https://publisher.example/research",
+                "published_at": datetime(2026, 8, 30, tzinfo=timezone.utc),
+                "related_symbols": ["RELIANCE"],
+            }
+        ],
+    )
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    register()
+
+    response = client.post(
+        "/api/v1/research",
+        json={"symbol": "reliance", "exchange": "NSE", "period": "3M"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["data"]["status"] == "HISTORICAL"
+    assert payload["data"]["source"] == "Temporary test CSV"
+    assert payload["data"]["candle_count"] == 39
+    assert payload["data"]["period_return_percent"] == pytest.approx(
+        (140 / 102 - 1) * 100
+    )
+    assert payload["data"]["indicators"]["sma_20"] == pytest.approx(130.5)
+    assert payload["news"]["status"] == "AVAILABLE"
+    assert payload["news"]["articles"][0]["url"] == "https://publisher.example/research"
+    assert payload["ai"]["status"] == "NOT_CONFIGURED"
+    assert payload["ai"]["summary"] is None
+    assert payload["source_references"][0]["kind"] == "HISTORICAL_DATA"
+    assert payload["source_references"][1]["url"] == "https://publisher.example/research"
+    assert any("no live" in limitation.lower() for limitation in payload["limitations"])
+
+
+def test_research_reports_missing_sources_without_claiming_success(monkeypatch):
+    class UnavailableHistory:
+        source_label = "Unavailable"
+
+        def status(self):
+            return {"configured": False}
+
+        def historical_daily_candles(self, *_args):
+            raise ProviderUnavailable("Historical provider is not configured.")
+
+    def no_news(**_kwargs):
+        raise main_module.NewsServiceUnavailable("News provider is not configured.")
+
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: UnavailableHistory()
+    )
+    monkeypatch.setattr(main_module, "fetch_financial_news", no_news)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    register()
+
+    response = client.post(
+        "/api/v1/research",
+        json={"symbol": "RELIANCE", "exchange": "NSE", "period": "1M"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["data"]["status"] == "UNAVAILABLE"
+    assert payload["data"]["source"] is None
+    assert payload["data"]["candle_count"] == 0
+    assert payload["news"]["status"] == "UNAVAILABLE"
+    assert payload["news"]["articles"] == []
+    assert payload["ai"]["status"] == "NO_SOURCES"
+    assert payload["ai"]["summary"] is None
+    assert payload["source_references"] == []
+
+
+def test_research_distinguishes_configured_provider_failure(monkeypatch):
+    class FailedConfiguredProvider:
+        source_label = "Finnhub daily historical candles"
+
+        def status(self):
+            return {"configured": True}
+
+        def historical_daily_candles(self, *_args):
+            raise ProviderUnavailable("Finnhub rejected the configured credentials.")
+
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: FailedConfiguredProvider()
+    )
+    monkeypatch.setattr(
+        main_module,
+        "fetch_financial_news",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            main_module.NewsServiceUnavailable("News provider is not configured.")
+        ),
+    )
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    register()
+
+    response = client.post(
+        "/api/v1/research",
+        json={"symbol": "RELIANCE", "exchange": "NSE", "period": "1M"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "ERROR"
+    assert response.json()["data"]["source"] is None
+    assert "rejected" in response.json()["data"]["message"]
+    assert response.json()["ai"]["status"] == "NO_SOURCES"
+
+
+def test_research_returns_configured_ai_summary_and_surfaces_ai_failure(monkeypatch):
+    class HistoricalProvider:
+        source_label = "Test historical source"
+
+        def historical_daily_candles(self, *_args):
+            return [
+                OHLCVCandle(
+                    timestamp=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                    open=10,
+                    high=12,
+                    low=9,
+                    close=11,
+                    volume=100,
+                )
+            ]
+
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: HistoricalProvider()
+    )
+    monkeypatch.setattr(
+        main_module, "fetch_financial_news", lambda **_kwargs: []
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    captured = {}
+
+    def summarize(research):
+        captured.update(research)
+        return "The supplied data contains one historical close."
+
+    monkeypatch.setattr(main_module, "summarize_research_with_gemini", summarize)
+    register()
+    request = {"symbol": "SAMPLE", "exchange": "NSE", "period": "1M"}
+
+    successful = client.post("/api/v1/research", json=request)
+    assert successful.status_code == 200
+    assert successful.json()["ai"]["status"] == "AVAILABLE"
+    assert successful.json()["ai"]["summary"].startswith("The supplied data")
+    assert captured["historical_data"]["source"] == "Test historical source"
+    assert captured["news"] == []
+
+    def failed_summary(_research):
+        raise main_module.NewsServiceError("Gemini returned no research explanation.")
+
+    monkeypatch.setattr(main_module, "summarize_research_with_gemini", failed_summary)
+    failed = client.post("/api/v1/research", json=request)
+    assert failed.status_code == 200
+    assert failed.json()["ai"]["status"] == "ERROR"
+    assert "Gemini" in failed.json()["ai"]["message"]
+
+
+def test_research_rate_limit_is_per_authenticated_user(monkeypatch):
+    class UnavailableHistory:
+        source_label = "Unavailable"
+
+        def status(self):
+            return {"configured": False}
+
+        def historical_daily_candles(self, *_args):
+            raise ProviderUnavailable("No market history.")
+
+    def no_news(**_kwargs):
+        raise main_module.NewsServiceUnavailable("No news.")
+
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: UnavailableHistory()
+    )
+    monkeypatch.setattr(main_module, "fetch_financial_news", no_news)
+    register()
+    request = {
+        "symbol": "RELIANCE",
+        "exchange": "NSE",
+        "period": "1M",
+    }
+
+    responses = [
+        client.post("/api/v1/research", json=request)
+        for _ in range(main_module.RESEARCH_RATE_LIMIT)
+    ]
+    limited = client.post("/api/v1/research", json=request)
+    assert all(response.status_code == 200 for response in responses)
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "60"
 
 
 def test_health_check():
@@ -147,6 +439,27 @@ def test_login_and_logout_revoke_session():
     assert client.get("/api/v1/auth/me").status_code == 401
 
 
+def test_valid_login_preserves_session_and_registration_hash_scheme():
+    register()
+    client.cookies.clear()
+    login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": " INVESTOR@EXAMPLE.COM ",
+            "password": "Correct horse battery 42",
+        },
+    )
+
+    assert login.status_code == 200
+    assert login.json()["email"] == "investor@example.com"
+    assert "password" not in login.json()
+    cookie = login.headers["set-cookie"].lower()
+    assert "httponly" in cookie
+    assert "samesite=lax" in cookie
+    assert "finsight_session=" in cookie
+    assert client.get("/api/v1/auth/me").json()["email"] == "investor@example.com"
+
+
 def test_invalid_password_has_generic_error():
     register()
     client.cookies.clear()
@@ -156,6 +469,64 @@ def test_invalid_password_has_generic_error():
     )
     assert response.status_code == 401
     assert response.json()["detail"] == "Invalid email or password"
+
+
+def test_unknown_account_uses_same_generic_login_error():
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"email": "missing@example.invalid", "password": "Unknown password 123"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid email or password"
+
+
+def test_invalid_session_cookie_is_rejected():
+    client.cookies.set(auth.COOKIE_NAME, "invalid-session-token")
+
+    response = client.get("/api/v1/auth/me")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Authentication required"
+    client.cookies.clear()
+
+
+def test_expired_session_is_rejected_and_removed():
+    register()
+    token = client.cookies.get(auth.COOKIE_NAME)
+    assert token
+
+    database_generator = app.dependency_overrides[get_db]()
+    database = next(database_generator)
+    try:
+        session_record = database.scalar(
+            select(AuthSession).where(
+                AuthSession.token_hash == auth._token_digest(token)
+            )
+        )
+        assert session_record is not None
+        session_record.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        database.commit()
+    finally:
+        database.close()
+        database_generator.close()
+
+    response = client.get("/api/v1/auth/me")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Session expired"
+    database_generator = app.dependency_overrides[get_db]()
+    database = next(database_generator)
+    try:
+        assert database.scalar(
+            select(AuthSession.id).where(
+                AuthSession.token_hash == auth._token_digest(token)
+            )
+        ) is None
+    finally:
+        database.close()
+        database_generator.close()
+    assert client.get("/api/v1/auth/me").status_code == 401
 
 
 def test_saved_screens_are_isolated_by_user():
@@ -229,6 +600,12 @@ def test_user_csv_provider_returns_validated_historical_data(tmp_path, monkeypat
     assert indicators.status_code == 200
     assert indicators.json()["data_status"] == "HISTORICAL"
     assert indicators.json()["indicators"]["sma"] == [None, 11.5, 13.5]
+    performance = indicators.json()["performance"]
+    assert performance["period_return_percent"] == pytest.approx(
+        (15 / 11 - 1) * 100
+    )
+    assert performance["daily_return_observations"] == 2
+    assert performance["annualized_volatility_percent"] is not None
     assert patterns.status_code == 200
     assert len(patterns.json()["patterns"]) == 1
     assert patterns.json()["patterns"][0]["prior_range_high"] == 13
@@ -258,6 +635,31 @@ def test_user_csv_rejects_invalid_ohlc_and_duplicate_timestamps(
     )
     duplicate = client.get("/api/v1/market-data/instruments/NSE/BAD/candles")
     assert duplicate.status_code == 422
+
+    path.write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2024-01-03,10,12,8,11,100\n"
+        "2024-01-02,10,12,8,11,100\n",
+        encoding="utf-8",
+    )
+    out_of_order = client.get("/api/v1/market-data/instruments/NSE/BAD/candles")
+    assert out_of_order.status_code == 422
+    assert "chronological order" in out_of_order.json()["detail"]
+
+    path.write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2024-01-02,not-a-number,12,8,11,100\n",
+        encoding="utf-8",
+    )
+    invalid_numeric = client.get("/api/v1/market-data/instruments/NSE/BAD/candles")
+    assert invalid_numeric.status_code == 422
+
+    path.write_text(
+        "Date,Open,High,Low,Close\n2024-01-02,10,12,8,11\n",
+        encoding="utf-8",
+    )
+    missing_columns = client.get("/api/v1/market-data/instruments/NSE/BAD/candles")
+    assert missing_columns.status_code == 422
 
 
 def test_user_csv_rejects_untrusted_symbol_path(tmp_path, monkeypatch):
@@ -453,6 +855,167 @@ def test_portfolio_accounting_and_user_isolation():
     assert client.get("/api/v1/portfolios").json() == []
     assert client.get(f"/api/v1/portfolios/{portfolio_id}/overview").status_code == 404
     assert client.get(transaction_url).status_code == 404
+    assert client.put(
+        f"{transaction_url}/{buy.json()['id']}",
+        json={
+            "symbol": "SAMPLE",
+            "exchange": "NSE",
+            "side": "BUY",
+            "quantity": 1,
+            "price": 20,
+            "transacted_at": "2024-01-03T09:00:00Z",
+        },
+    ).status_code == 404
+    assert client.delete(f"{transaction_url}/{buy.json()['id']}").status_code == 404
+
+
+def test_portfolio_purchase_partial_sale_full_sale_and_persisted_average_cost(
+    monkeypatch,
+):
+    register("ledger-owner@example.com")
+
+    class PortfolioPriceProvider:
+        source_label = "Portfolio test history"
+
+        def status(self):
+            return {"provider": "test_history", "configured": True}
+
+        def historical_daily_candles(self, *_args):
+            return [
+                OHLCVCandle(
+                    timestamp=datetime.now(timezone.utc) - timedelta(days=1),
+                    open=130,
+                    high=132,
+                    low=129,
+                    close=130,
+                    volume=1000,
+                )
+            ]
+
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: PortfolioPriceProvider()
+    )
+    portfolio = client.post(
+        "/api/v1/portfolios", json={"name": "Ledger verification", "initial_cash": 10_000}
+    ).json()
+    base = f"/api/v1/portfolios/{portfolio['id']}/transactions"
+
+    def transact(side, quantity, price, fees, day):
+        return client.post(
+            base,
+            json={
+                "symbol": "SAMPLE",
+                "exchange": "NSE",
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "fees": fees,
+                "transacted_at": f"2026-01-0{day}T09:00:00Z",
+            },
+        )
+
+    first_buy = transact("BUY", 10, 100, 10, 1)
+    second_buy = transact("BUY", 10, 120, 10, 2)
+    partial_sale = transact("SELL", 5, 150, 5, 3)
+    assert [first_buy.status_code, second_buy.status_code, partial_sale.status_code] == [
+        201,
+        201,
+        201,
+    ]
+
+    partial = client.get(f"/api/v1/portfolios/{portfolio['id']}/overview").json()
+    holding = partial["holdings"][0]
+    assert partial["cash_balance"] == pytest.approx(8525)
+    assert partial["total_invested_capital"] == pytest.approx(1665)
+    assert partial["realized_pnl"] == pytest.approx(190)
+    assert partial["unrealized_pnl"] == pytest.approx(285)
+    assert partial["total_value"] == pytest.approx(10475)
+    assert holding["quantity"] == pytest.approx(15)
+    assert holding["average_cost"] == pytest.approx(111)
+    assert holding["invested_amount"] == pytest.approx(1665)
+    assert holding["historical_last_close"] == pytest.approx(130)
+    assert holding["market_value"] == pytest.approx(1950)
+
+    full_sale = transact("SELL", 15, 90, 5, 4)
+    assert full_sale.status_code == 201
+    closed = client.get(f"/api/v1/portfolios/{portfolio['id']}/overview").json()
+    refreshed_ledger = client.get(base).json()
+    assert closed["cash_balance"] == pytest.approx(9870)
+    assert closed["total_invested_capital"] == pytest.approx(0)
+    assert closed["realized_pnl"] == pytest.approx(-130)
+    assert closed["unrealized_pnl"] == pytest.approx(0)
+    assert closed["valuation_status"] == "CASH_ONLY"
+    assert closed["total_value"] == pytest.approx(9870)
+    assert closed["holdings"] == []
+    assert len(refreshed_ledger) == 4
+    assert [item["side"] for item in refreshed_ledger] == ["BUY", "BUY", "SELL", "SELL"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_status", "expected_freshness", "expected_message"),
+    [
+        (
+            RiskTestProvider(candles=[]),
+            "UNAVAILABLE",
+            "UNKNOWN",
+            "No historical candles",
+        ),
+        (
+            RiskTestProvider(
+                failure=ProviderUnavailable("sanitized provider failure")
+            ),
+            "UNAVAILABLE",
+            "UNKNOWN",
+            "provider failed",
+        ),
+        (
+            RiskTestProvider(candles=risk_test_candles(age_days=12)),
+            "HISTORICAL",
+            "STALE_HISTORY",
+            None,
+        ),
+    ],
+)
+def test_portfolio_missing_failed_and_stale_market_prices_are_explicit(
+    monkeypatch, provider, expected_status, expected_freshness, expected_message
+):
+    register("price-owner@example.com")
+    portfolio = client.post(
+        "/api/v1/portfolios", json={"name": "Price checks", "initial_cash": 1000}
+    ).json()
+    transaction = client.post(
+        f"/api/v1/portfolios/{portfolio['id']}/transactions",
+        json={
+            "symbol": "SAMPLE",
+            "exchange": "NSE",
+            "side": "BUY",
+            "quantity": 2,
+            "price": 100,
+            "fees": 2,
+            "transacted_at": "2026-01-01T09:00:00Z",
+        },
+    )
+    assert transaction.status_code == 201
+    monkeypatch.setattr(main_module, "get_market_data_provider", lambda: provider)
+
+    overview = client.get(f"/api/v1/portfolios/{portfolio['id']}/overview")
+    assert overview.status_code == 200
+    result = overview.json()
+    holding = result["holdings"][0]
+    assert result["total_invested_capital"] == pytest.approx(202)
+    assert holding["price_status"] == expected_status
+    assert holding["freshness_status"] == expected_freshness
+    if expected_message:
+        assert expected_message in holding["price_message"]
+        assert holding["historical_last_close"] is None
+        assert holding["market_value"] is None
+        assert holding["unrealized_pnl"] is None
+        assert result["total_value"] is None
+        assert result["unrealized_pnl"] is None
+    else:
+        assert holding["price_as_of"] is not None
+        assert holding["market_value"] is not None
+        assert result["valuation_status"] == "HISTORICAL"
 
 
 def test_portfolio_transactions_can_be_updated_and_deleted():
@@ -582,3 +1145,218 @@ def test_alert_lifecycle_is_owner_scoped_and_provider_unavailability_is_clear():
     assert client.patch(
         f"/api/v1/alerts/{alert_id}", json={"enabled": True}
     ).status_code == 404
+
+
+def test_risk_meter_requires_auth_and_configured_historical_data(monkeypatch):
+    payload = {"symbol": "SAMPLE", "exchange": "NSE", "period": "3M"}
+    assert client.post("/api/v1/risk-meter", json=payload).status_code == 401
+
+    register()
+    monkeypatch.setattr(
+        main_module,
+        "get_market_data_provider",
+        lambda: RiskTestProvider(configured=False),
+    )
+    response = client.post("/api/v1/risk-meter", json=payload)
+    assert response.status_code == 503
+    assert "no configured historical" in response.json()["detail"]
+
+
+def test_risk_meter_returns_verified_values_and_deterministic_explanation(monkeypatch):
+    register()
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: RiskTestProvider()
+    )
+
+    response = client.post(
+        "/api/v1/risk-meter",
+        json={"symbol": "sample", "exchange": "NSE", "period": "3M"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["symbol"] == "SAMPLE"
+    assert result["status"] == "READY"
+    assert result["recommendation"] in {"BUY", "HOLD", "SELL / REDUCE EXPOSURE"}
+    assert 0 <= result["score"] <= 100
+    assert result["values"]["latest_close"] == 131
+    assert result["values"]["sma_20"] is not None
+    assert result["source"] == "Risk meter test history"
+    assert result["data_as_of"]
+    assert result["top_factors"]
+    assert len(result["top_factors"]) <= 3
+    assert result["what_could_change"]
+    assert result["ai_explanation_status"] == "NOT_REQUESTED"
+
+
+def test_risk_meter_handles_provider_error_and_suppresses_stale_recommendations(
+    monkeypatch,
+):
+    register()
+    payload = {"symbol": "SAMPLE", "exchange": "NSE", "period": "3M"}
+    monkeypatch.setattr(
+        main_module,
+        "get_market_data_provider",
+        lambda: RiskTestProvider(
+            failure=ProviderUnavailable("sanitized upstream failure")
+        ),
+    )
+    failed = client.post("/api/v1/risk-meter", json=payload)
+    assert failed.status_code == 502
+    assert "could not supply" in failed.json()["detail"]
+    assert "sanitized upstream failure" not in failed.json()["detail"]
+
+    monkeypatch.setattr(
+        main_module,
+        "get_market_data_provider",
+        lambda: RiskTestProvider(candles=risk_test_candles(age_days=12)),
+    )
+    stale = client.post("/api/v1/risk-meter", json=payload)
+    assert stale.status_code == 200
+    assert stale.json()["status"] == "STALE_HISTORY"
+    assert stale.json()["score"] is not None
+    assert stale.json()["recommendation"] == "NOT AVAILABLE"
+
+
+def test_risk_meter_empty_data_and_invalid_request_do_not_create_a_score(monkeypatch):
+    register()
+    invalid = client.post(
+        "/api/v1/risk-meter",
+        json={"symbol": "SAMPLE", "exchange": "NSE", "period": "2M"},
+    )
+    assert invalid.status_code == 422
+
+    monkeypatch.setattr(
+        main_module,
+        "get_market_data_provider",
+        lambda: RiskTestProvider(candles=[]),
+    )
+    empty = client.post(
+        "/api/v1/risk-meter",
+        json={"symbol": "SAMPLE", "exchange": "NSE", "period": "3M"},
+    )
+    assert empty.status_code == 200
+    assert empty.json()["status"] == "UNKNOWN_FRESHNESS"
+    assert empty.json()["score"] is None
+    assert empty.json()["recommendation"] == "NOT AVAILABLE"
+    assert empty.json()["source"] is None
+
+
+def test_risk_meter_applies_owner_scoped_portfolio_concentration(monkeypatch):
+    register("risk-owner@example.com")
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: RiskTestProvider()
+    )
+    portfolio = client.post(
+        "/api/v1/portfolios", json={"name": "Concentrated", "initial_cash": 1000}
+    ).json()
+    transaction = client.post(
+        f"/api/v1/portfolios/{portfolio['id']}/transactions",
+        json={
+            "symbol": "SAMPLE",
+            "exchange": "NSE",
+            "side": "BUY",
+            "quantity": 50,
+            "price": 10,
+            "fees": 0,
+            "transacted_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    assert transaction.status_code == 201
+    request = {
+        "symbol": "SAMPLE",
+        "exchange": "NSE",
+        "period": "3M",
+        "portfolio_id": portfolio["id"],
+    }
+    assessment = client.post("/api/v1/risk-meter", json=request)
+    assert assessment.status_code == 200
+    result = assessment.json()
+    assert result["portfolio_context"]["portfolio_name"] == "Concentrated"
+    assert result["values"]["portfolio_allocation_percent"] > 50
+    assert result["risk_level"] == "HIGH"
+    assert any(factor["key"] == "concentration" for factor in result["factors"])
+
+    client.post("/api/v1/auth/logout")
+    register("risk-other@example.com")
+    isolated = client.post("/api/v1/risk-meter", json=request)
+    assert isolated.status_code == 404
+
+
+def test_risk_meter_gemini_only_adds_explanation_and_never_changes_score(monkeypatch):
+    register()
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: RiskTestProvider()
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
+    monkeypatch.setattr(
+        main_module,
+        "explain_risk_meter_with_gemini",
+        lambda verified: "A separate explanation of the supplied calculations.",
+    )
+    request = {
+        "symbol": "SAMPLE",
+        "exchange": "NSE",
+        "period": "3M",
+        "include_ai_explanation": True,
+    }
+    with_ai = client.post("/api/v1/risk-meter", json=request)
+    assert with_ai.status_code == 200
+    assert with_ai.json()["ai_explanation_status"] == "AVAILABLE"
+    assert with_ai.json()["ai_explanation"]
+    assert with_ai.json()["score"] == client.post(
+        "/api/v1/risk-meter",
+        json={**request, "include_ai_explanation": False},
+    ).json()["score"]
+
+
+def test_risk_meter_without_gemini_key_keeps_score_and_reports_not_configured(
+    monkeypatch,
+):
+    register()
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: RiskTestProvider()
+    )
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    response = client.post(
+        "/api/v1/risk-meter",
+        json={
+            "symbol": "SAMPLE",
+            "exchange": "NSE",
+            "period": "3M",
+            "include_ai_explanation": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["score"] is not None
+    assert response.json()["ai_explanation_status"] == "NOT_CONFIGURED"
+    assert response.json()["ai_explanation"] is None
+
+
+def test_risk_meter_gemini_failure_keeps_deterministic_result(monkeypatch):
+    register()
+    monkeypatch.setattr(
+        main_module, "get_market_data_provider", lambda: RiskTestProvider()
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
+
+    def fail_explanation(_verified):
+        raise main_module.NewsServiceError("Gemini returned HTTP 404.")
+
+    monkeypatch.setattr(main_module, "explain_risk_meter_with_gemini", fail_explanation)
+    response = client.post(
+        "/api/v1/risk-meter",
+        json={
+            "symbol": "SAMPLE",
+            "exchange": "NSE",
+            "period": "3M",
+            "include_ai_explanation": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["score"] is not None
+    assert response.json()["recommendation"] != "NOT AVAILABLE"
+    assert response.json()["ai_explanation_status"] == "ERROR"
+    assert response.json()["ai_explanation"] is None

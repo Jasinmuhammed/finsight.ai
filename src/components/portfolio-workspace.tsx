@@ -1,7 +1,9 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { RiskMeterReport } from "@/components/risk-meter-report";
+import type { RiskMeterResponse } from "@/types/risk-meter";
 
 type Portfolio = {
   id: string;
@@ -26,24 +28,30 @@ type Holding = {
   exchange: string;
   quantity: number;
   average_cost: number;
+  invested_amount: number;
   historical_last_close: number | null;
   market_value: number | null;
   realized_pnl: number;
   unrealized_pnl: number | null;
   allocation_percent: number | null;
   price_status: string;
+  price_message: string | null;
   price_as_of: string | null;
+  freshness_status: string;
 };
 
 type Overview = {
   portfolio_id: string;
   initial_cash: number;
   cash_balance: number;
+  total_invested_capital: number;
   cash_allocation_percent: number | null;
   total_value: number | null;
   realized_pnl: number;
   unrealized_pnl: number | null;
   valuation_status: string;
+  price_source: string;
+  freshness_status: string;
   data_as_of: string | null;
   holdings: Holding[];
   risk: {
@@ -72,6 +80,21 @@ function formatCurrency(value: number | null) {
   }).format(value);
 }
 
+function formatMarketTimestamp(value: string | null) {
+  if (!value) return "Not available";
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return "Timestamp unavailable";
+  return timestamp.toLocaleString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Asia/Kolkata",
+    timeZoneName: "short",
+  });
+}
+
 async function parseResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const body = (await response.json()) as { detail?: string };
@@ -97,13 +120,21 @@ export function PortfolioWorkspace() {
   const [transactedAt, setTransactedAt] = useState(localDateTimeValue);
   const [editingId, setEditingId] = useState("");
   const [loading, setLoading] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [savingTransaction, setSavingTransaction] = useState(false);
+  const transactionSubmission = useRef(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [riskAssessment, setRiskAssessment] = useState<RiskMeterResponse | null>(null);
+  const [riskMeterError, setRiskMeterError] = useState("");
+  const [riskExplainLoading, setRiskExplainLoading] = useState(false);
 
   async function refreshPortfolio(portfolioId: string) {
     if (!portfolioId) return;
     setLoading(true);
     setError("");
+    setRiskAssessment(null);
+    setRiskMeterError("");
     try {
       const [overviewResponse, transactionsResponse] = await Promise.all([
         fetch(`${apiBase}/portfolios/${portfolioId}/overview`, { credentials: "include" }),
@@ -115,10 +146,74 @@ export function PortfolioWorkspace() {
       ]);
       setOverview(nextOverview);
       setTransactions(nextTransactions);
+      setRiskAssessment(null);
+      const focusHolding = [...nextOverview.holdings]
+        .filter((holding) => holding.allocation_percent !== null)
+        .sort(
+          (left, right) =>
+            (right.allocation_percent ?? 0) - (left.allocation_percent ?? 0),
+        )[0];
+      if (focusHolding) {
+        try {
+          const riskResponse = await fetch(`${apiBase}/risk-meter`, {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              symbol: focusHolding.symbol,
+              exchange: focusHolding.exchange,
+              period: "3M",
+              portfolio_id: portfolioId,
+            }),
+          });
+          const riskResult = await parseResponse<RiskMeterResponse>(riskResponse);
+          setRiskAssessment(riskResult);
+          setRiskMeterError("");
+        } catch (riskError) {
+          setRiskAssessment(null);
+          setRiskMeterError(
+            riskError instanceof Error
+              ? riskError.message
+              : "Holding risk assessment is unavailable.",
+          );
+        }
+      } else {
+        setRiskMeterError("");
+      }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Could not load portfolio.");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function explainHoldingRisk() {
+    if (!riskAssessment || !selectedId) return;
+    setRiskExplainLoading(true);
+    setRiskMeterError("");
+    try {
+      const response = await fetch(`${apiBase}/risk-meter`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: riskAssessment.symbol,
+          exchange: riskAssessment.exchange,
+          period: riskAssessment.period,
+          portfolio_id: selectedId,
+          include_ai_explanation: true,
+        }),
+      });
+      const explained = await parseResponse<RiskMeterResponse>(response);
+      setRiskAssessment(explained);
+    } catch (requestError) {
+      setRiskMeterError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Gemini explanation is unavailable; the deterministic score is unchanged.",
+      );
+    } finally {
+      setRiskExplainLoading(false);
     }
   }
 
@@ -137,6 +232,9 @@ export function PortfolioWorkspace() {
         if (requestError instanceof Error && requestError.name !== "AbortError") {
           setError(requestError.message);
         }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setInitialLoading(false);
       });
     return () => controller.abort();
   }, []);
@@ -167,7 +265,9 @@ export function PortfolioWorkspace() {
 
   async function saveTransaction(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedId) return;
+    if (!selectedId || transactionSubmission.current) return;
+    transactionSubmission.current = true;
+    setSavingTransaction(true);
     setError("");
     setNotice("");
     const path = `${apiBase}/portfolios/${selectedId}/transactions`;
@@ -196,6 +296,9 @@ export function PortfolioWorkspace() {
       await refreshPortfolio(selectedId);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Could not record transaction.");
+    } finally {
+      transactionSubmission.current = false;
+      setSavingTransaction(false);
     }
   }
 
@@ -251,6 +354,14 @@ export function PortfolioWorkspace() {
     );
   }
 
+  if (initialLoading) {
+    return <section className="section-card empty-state" role="status">Loading your portfolios…</section>;
+  }
+
+  const selectedHolding = overview?.holdings.find(
+    (holding) => holding.symbol === symbol.trim().toUpperCase() && holding.exchange === exchange,
+  );
+
   return (
     <div className="page-stack">
       {error && <div className="error-state portfolio-error" role="alert">{error}</div>}
@@ -286,13 +397,15 @@ export function PortfolioWorkspace() {
               <div className="notice" role="note">
                 <span className="notice-dot" />
                 <div><strong>Historical valuation · {overview.valuation_status}</strong><p>
-                  Prices are last closes from user-supplied CSV, not live quotes.
-                  {overview.data_as_of && ` Latest available close: ${new Date(overview.data_as_of).toLocaleDateString()}.`}
+                  Prices use {overview.price_source}; they are historical daily closes, not live quotes.
+                  Freshness: {overview.freshness_status.replaceAll("_", " ").toLowerCase()}.
+                  {overview.data_as_of && ` Latest available close: ${formatMarketTimestamp(overview.data_as_of)}.`}
                 </p></div>
               </div>
               <div className="metric-grid portfolio-metrics">
                 <article className="metric-card"><p className="metric-label">Cash balance</p><p className="metric-value">{formatCurrency(overview.cash_balance)}</p><p className="metric-note">{overview.cash_allocation_percent === null ? "Allocation unavailable" : `${overview.cash_allocation_percent.toFixed(2)}% of valued assets`} · after fees</p></article>
                 <article className="metric-card"><p className="metric-label">Portfolio value</p><p className="metric-value">{formatCurrency(overview.total_value)}</p><p className="metric-note">Incomplete if a holding lacks history</p></article>
+                <article className="metric-card"><p className="metric-label">Invested in open holdings</p><p className="metric-value">{formatCurrency(overview.total_invested_capital)}</p><p className="metric-note">Remaining average-cost basis, including allocated buy charges</p></article>
                 <article className="metric-card"><p className="metric-label">Realized P&amp;L</p><p className={`metric-value ${overview.realized_pnl >= 0 ? "positive" : "negative"}`}>{formatCurrency(overview.realized_pnl)}</p><p className="metric-note">Average-cost accounting, net of sell fees</p></article>
                 <article className="metric-card"><p className="metric-label">Unrealized P&amp;L</p><p className="metric-value">{formatCurrency(overview.unrealized_pnl)}</p><p className="metric-note">Uses last available historical closes</p></article>
               </div>
@@ -300,12 +413,13 @@ export function PortfolioWorkspace() {
               <section className="section-card">
                 <div className="section-heading compact"><div><p className="eyebrow">POSITIONS</p><h2>Holdings &amp; allocation</h2></div></div>
                 {overview.holdings.length ? (
-                  <div className="table-wrap"><table><thead><tr><th>Instrument</th><th>Quantity</th><th>Average cost</th><th>Last historical close</th><th>Market value</th><th>Unrealized P&amp;L</th><th>Allocation</th></tr></thead>
+                  <div className="table-wrap"><table><thead><tr><th>Instrument</th><th>Quantity</th><th>Average buy price</th><th>Invested amount</th><th>Historical price</th><th>Market value</th><th>Unrealized P&amp;L</th><th>Allocation</th></tr></thead>
                     <tbody>{overview.holdings.map((holding) => <tr key={`${holding.exchange}-${holding.symbol}`}>
                       <td><strong>{holding.symbol}</strong><small className="table-subtitle">{holding.exchange}</small></td>
-                      <td>{holding.quantity}</td><td>{formatCurrency(holding.average_cost)}</td>
-                      <td>{formatCurrency(holding.historical_last_close)}<small className="table-subtitle">{holding.price_as_of ? new Date(holding.price_as_of).toLocaleDateString() : holding.price_status}</small></td>
-                      <td>{formatCurrency(holding.market_value)}</td><td>{formatCurrency(holding.unrealized_pnl)}</td>
+                      <td>{holding.quantity}</td><td>{formatCurrency(holding.average_cost)}<small className="table-subtitle">Weighted average incl. buy charges</small></td>
+                      <td>{formatCurrency(holding.invested_amount)}</td>
+                      <td>{formatCurrency(holding.historical_last_close)}<small className="table-subtitle">{holding.price_as_of ? `${formatMarketTimestamp(holding.price_as_of)} · ${holding.freshness_status.replaceAll("_", " ").toLowerCase()}` : holding.price_message ?? holding.price_status}</small></td>
+                      <td>{formatCurrency(holding.market_value)}</td><td className={holding.unrealized_pnl === null ? "" : holding.unrealized_pnl >= 0 ? "positive" : "negative"}>{formatCurrency(holding.unrealized_pnl)}</td>
                       <td>{holding.allocation_percent === null ? "—" : `${holding.allocation_percent.toFixed(2)}%`}</td>
                     </tr>)}</tbody></table></div>
                 ) : <div className="empty-state"><strong>No holdings yet</strong><p>Record a buy transaction below.</p></div>}
@@ -344,6 +458,29 @@ export function PortfolioWorkspace() {
                 )}
                 <ul className="risk-assumptions">{overview.risk.assumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}</ul>
               </section>
+              <section className="section-card risk-meter-portfolio">
+                <div className="section-heading compact">
+                  <div>
+                    <p className="eyebrow">CONCENTRATION-AWARE CONTEXT</p>
+                    <h2>Largest holding risk meter</h2>
+                    <p className="muted">The most concentrated valued holding is assessed with this portfolio&apos;s historical risk.</p>
+                  </div>
+                </div>
+                {riskMeterError && <div className="error-state inline-error" role="alert">{riskMeterError}</div>}
+                {riskAssessment && (
+                  <RiskMeterReport
+                    assessment={riskAssessment}
+                    explanationLoading={riskExplainLoading}
+                    onExplain={() => void explainHoldingRisk()}
+                  />
+                )}
+                {!riskMeterError && !riskAssessment && overview.holdings.length === 0 && (
+                  <p className="muted">Add a holding with an available historical valuation to calculate this meter.</p>
+                )}
+                {!riskMeterError && !riskAssessment && overview.holdings.length > 0 && (
+                  <p className="muted" role="status">Calculating the largest valued holding&apos;s risk assessment…</p>
+                )}
+              </section>
             </>
           )}
 
@@ -353,11 +490,11 @@ export function PortfolioWorkspace() {
               <label className="field"><span>Symbol</span><input maxLength={32} onChange={(event) => setSymbol(event.target.value)} required value={symbol} /></label>
               <label className="field"><span>Exchange</span><select onChange={(event) => setExchange(event.target.value as "NSE" | "BSE")} value={exchange}><option value="NSE">NSE</option><option value="BSE">BSE</option></select></label>
               <label className="field"><span>Side</span><select onChange={(event) => setSide(event.target.value as "BUY" | "SELL")} value={side}><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label>
-              <label className="field"><span>Quantity</span><input min="0.000001" onChange={(event) => setQuantity(event.target.value)} required step="any" type="number" value={quantity} /></label>
+              <label className="field"><span>Quantity</span><input max={side === "SELL" ? selectedHolding?.quantity : undefined} min="0.000001" onChange={(event) => setQuantity(event.target.value)} required step="any" type="number" value={quantity} />{side === "SELL" && <small>{selectedHolding ? `Available to sell: ${selectedHolding.quantity}` : "No matching shares are currently held."}</small>}</label>
               <label className="field"><span>Price (₹)</span><input min="0.01" onChange={(event) => setPrice(event.target.value)} required step="any" type="number" value={price} /></label>
               <label className="field"><span>Fees (₹)</span><input min="0" onChange={(event) => setFees(event.target.value)} required step="any" type="number" value={fees} /></label>
-              <label className="field"><span>Transaction time</span><input onChange={(event) => setTransactedAt(event.target.value)} required type="datetime-local" value={transactedAt} /></label>
-              <div className="transaction-actions"><button className="primary-button" disabled={loading} type="submit">{editingId ? "Save changes" : "Record transaction"}</button>
+              <label className="field"><span>Transaction date and time</span><input onChange={(event) => setTransactedAt(event.target.value)} required type="datetime-local" value={transactedAt} /></label>
+              <div className="transaction-actions"><button className="primary-button" disabled={loading || savingTransaction || (side === "SELL" && !selectedHolding)} type="submit">{savingTransaction ? "Saving…" : editingId ? "Save changes" : side === "BUY" ? "Record purchase" : "Record sale"}</button>
                 {editingId && <button className="secondary-button" onClick={resetTransactionForm} type="button">Cancel edit</button>}</div>
             </form>
             <p className="table-footnote">Uses weighted-average cost basis. Buys reduce starting cash; sells are rejected if they exceed held quantity. Transactions do not fetch or invent current prices.</p>

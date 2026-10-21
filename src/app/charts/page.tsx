@@ -5,12 +5,12 @@ export default function ChartsPage() {
     <div className="page-stack">
       <section className="page-heading">
         <div>
-          <p className="eyebrow">PRICE ACTION</p>
-          <h1>Charts &amp; patterns</h1>
-          <p className="muted">Explore imported daily candles with transparent indicator rules.</p>
+          <p className="eyebrow">CHART WORKSPACE</p>
+          <h1>Chart analysis</h1>
+          <p className="muted">Explore historical candles, technical overlays, and rule-based pattern markers.</p>
         </div>
       </section>
-      <HistoricalChart />
+      <HistoricalChart mode="chart" />
     </div>
   );
 }

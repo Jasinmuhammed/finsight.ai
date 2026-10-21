@@ -4,7 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 from backend.analytics import ema, relative_volume, rsi, sma
-from backend.market_data import MarketDataProvider
+from backend.market_data import MarketDataProvider, historical_freshness
 
 
 class AdvancedScreenerRequest(BaseModel):
@@ -54,6 +54,7 @@ class ScreenerMatch(BaseModel):
     ema: float | None
     matched_conditions: list[str]
     data_as_of: datetime
+    freshness_status: Literal["RECENT_HISTORY", "STALE_HISTORY", "UNKNOWN"]
 
 
 class AdvancedScreenerResponse(BaseModel):
@@ -64,6 +65,9 @@ class AdvancedScreenerResponse(BaseModel):
     data_status: Literal["HISTORICAL"]
     source: str
     data_as_of: datetime | None
+    freshness_status: Literal[
+        "RECENT_HISTORY", "STALE_HISTORY", "MIXED_HISTORY", "UNKNOWN"
+    ]
 
 
 def screen_historical_instruments(
@@ -190,6 +194,7 @@ def screen_historical_instruments(
                     ema=current_ema,
                     matched_conditions=passed_conditions,
                     data_as_of=candles[-1].timestamp,
+                    freshness_status=historical_freshness(candles[-1].timestamp),
                 )
             )
 
@@ -207,12 +212,21 @@ def screen_historical_instruments(
         matches = [*available, *missing]
 
     data_as_of = max((item.data_as_of for item in matches), default=None)
+    freshness_states = {item.freshness_status for item in matches}
+    freshness_status = (
+        "UNKNOWN"
+        if not freshness_states
+        else next(iter(freshness_states))
+        if len(freshness_states) == 1
+        else "MIXED_HISTORY"
+    )
     return AdvancedScreenerResponse(
         results=matches[filters.offset : filters.offset + filters.limit],
         count=len(matches),
         limit=filters.limit,
         offset=filters.offset,
         data_status="HISTORICAL",
-        source="User-supplied CSV; source provenance is not independently verified.",
+        source=provider.source_label,
         data_as_of=data_as_of,
+        freshness_status=freshness_status,
     )

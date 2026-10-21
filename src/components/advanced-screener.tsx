@@ -30,6 +30,7 @@ type ScreenerResult = {
   ema: number | null;
   matched_conditions: string[];
   data_as_of: string;
+  freshness_status: "RECENT_HISTORY" | "STALE_HISTORY" | "UNKNOWN";
 };
 
 type ScreenerPayload = {
@@ -40,6 +41,11 @@ type ScreenerPayload = {
   data_status: "HISTORICAL";
   source: string;
   data_as_of: string | null;
+  freshness_status:
+    | "RECENT_HISTORY"
+    | "STALE_HISTORY"
+    | "MIXED_HISTORY"
+    | "UNKNOWN";
 };
 
 type SavedScreen = {
@@ -52,6 +58,7 @@ type ProviderStatus = {
   provider: string;
   status: string;
   configured: boolean;
+  universe_configured?: boolean;
   message: string;
 };
 
@@ -251,14 +258,28 @@ export function AdvancedScreener() {
         </span>
       </div>
       <p className="data-provenance">
-        Scans user-supplied daily CSV history only. Imported data is not independently verified;
-        no simulated values are used for these results.
+        Scans daily historical candles from the configured provider; these are historical bars,
+        never live quotes. Source and latest-bar age are shown with results.
       </p>
       {provider && !provider.configured && (
         <div className="provider-warning" role="status">
-          {provider.message} Configure <code>MARKET_DATA_PROVIDER=csv</code> and{" "}
-          <code>MARKET_DATA_CSV_DIR</code>, then restart the API.
+          {provider.message}{" "}
+          {provider.provider === "finnhub" ? (
+            <>Configure <code>FINNHUB_API_KEY</code>, then restart the API.</>
+          ) : (
+            <>Configure <code>MARKET_DATA_PROVIDER=csv</code> and{" "}
+            <code>MARKET_DATA_CSV_DIR</code>, then restart the API.</>
+          )}
         </div>
+      )}
+      {provider?.provider === "finnhub" &&
+        provider.configured &&
+        !provider.universe_configured && (
+          <div className="provider-warning" role="status">
+            Configure a comma-separated <code>FINNHUB_SYMBOLS</code> universe
+            (for example <code>NSE:RELIANCE,BSE:500325</code>) and restart the API
+            to enable whole-universe screening.
+          </div>
       )}
       <form className="advanced-filter-form" onSubmit={submit}>
         <label className="field">
@@ -318,7 +339,15 @@ export function AdvancedScreener() {
             <option value="asc">Ascending</option>
           </select>
         </label>
-        <button className="primary-button" disabled={loading || !provider?.configured} type="submit">
+        <button
+          className="primary-button"
+          disabled={
+            loading ||
+            !provider?.configured ||
+            (provider.provider === "finnhub" && !provider.universe_configured)
+          }
+          type="submit"
+        >
           {loading ? "Screening…" : "Run historical screen"}
         </button>
       </form>
@@ -368,7 +397,7 @@ export function AdvancedScreener() {
                   <thead>
                     <tr>
                       <th>Symbol</th><th>Exchange</th><th>Close (₹)</th><th>Change</th>
-                      <th>Volume</th><th>Rel. vol.</th><th>RSI</th><th>Matched rules</th>
+                      <th>Volume</th><th>Rel. vol.</th><th>RSI</th><th>Freshness</th><th>Matched rules</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -381,6 +410,13 @@ export function AdvancedScreener() {
                         <td>{item.volume.toLocaleString("en-IN")}</td>
                         <td>{formatValue(item.relative_volume)}×</td>
                         <td>{formatValue(item.rsi)}</td>
+                        <td>
+                          {item.freshness_status === "RECENT_HISTORY"
+                            ? "Recent history"
+                            : item.freshness_status === "STALE_HISTORY"
+                              ? "Stale history"
+                              : "Unknown"}
+                        </td>
                         <td>{item.matched_conditions.length ? item.matched_conditions.join(", ") : "—"}</td>
                       </tr>
                     ))}

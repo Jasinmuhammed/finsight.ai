@@ -1,6 +1,8 @@
 "use client";
 
-import { FormEvent, PointerEvent, useRef, useState } from "react";
+import { FormEvent, PointerEvent, useEffect, useRef, useState } from "react";
+import { RiskMeterReport } from "@/components/risk-meter-report";
+import type { RiskMeterResponse } from "@/types/risk-meter";
 
 type Candle = {
   timestamp: string;
@@ -28,9 +30,71 @@ type ChartData = {
   patterns: Pattern[];
   source: string;
   dataStatus: string;
+  freshnessStatus: string;
+  dataAsOf: string | null;
+  performance: {
+    period_return_percent: number | null;
+    annualized_volatility_percent: number | null;
+    daily_return_observations: number;
+    method: string;
+  };
 };
 
 type ApiError = { detail?: string };
+type Instrument = {
+  symbol: string;
+  exchange: "NSE" | "BSE";
+  name: string;
+};
+type PortfolioOption = { id: string; name: string };
+
+type ResearchResult = {
+  symbol: string;
+  exchange: "NSE" | "BSE";
+  period: string;
+  data: {
+    status: "HISTORICAL" | "UNAVAILABLE" | "ERROR";
+    source: string | null;
+    freshness_status: string | null;
+    data_as_of: string | null;
+    candle_count: number;
+    period_return_percent: number | null;
+    annualized_volatility_percent: number | null;
+    daily_return_observations: number;
+    indicators: Record<string, number | null>;
+    message: string | null;
+  };
+  news: {
+    status: "AVAILABLE" | "NO_ARTICLES" | "UNAVAILABLE" | "ERROR";
+    source: string | null;
+    articles: {
+      source: string;
+      source_id: string;
+      headline: string;
+      summary: string;
+      url: string;
+      published_at: string;
+      related_symbols: string[];
+    }[];
+    message: string | null;
+  };
+  ai: {
+    status: "AVAILABLE" | "NOT_CONFIGURED" | "NO_SOURCES" | "ERROR";
+    summary: string | null;
+    message: string | null;
+  };
+  risk_considerations: string[];
+  source_references: {
+    kind: "HISTORICAL_DATA" | "NEWS";
+    source: string;
+    title: string;
+    url: string | null;
+    as_of: string | null;
+  }[];
+  limitations: string[];
+};
+
+type HistoricalChartMode = "analysis" | "chart";
 
 const apiBase =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
@@ -55,32 +119,154 @@ function formatDate(value: string) {
   });
 }
 
-export function HistoricalChart() {
+function formatTimestamp(value: string) {
+  return new Date(value).toLocaleString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Asia/Kolkata",
+    timeZoneName: "short",
+  });
+}
+
+export function HistoricalChart({
+  mode = "analysis",
+}: {
+  mode?: HistoricalChartMode;
+}) {
   const chartRef = useRef<SVGSVGElement>(null);
   const [symbol, setSymbol] = useState("");
   const [exchange, setExchange] = useState("NSE");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+  const [instruments, setInstruments] = useState<Instrument[]>([]);
+  const [searchMessage, setSearchMessage] = useState("");
   const [data, setData] = useState<ChartData | null>(null);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [visibleBars, setVisibleBars] = useState(2000);
   const [showSma, setShowSma] = useState(true);
   const [showEma, setShowEma] = useState(false);
   const [showRsi, setShowRsi] = useState(false);
   const [showMacd, setShowMacd] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [researchPeriod, setResearchPeriod] = useState("3M");
+  const [research, setResearch] = useState<ResearchResult | null>(null);
+  const [researchLoading, setResearchLoading] = useState(false);
+  const [researchError, setResearchError] = useState("");
+  const [riskPeriod, setRiskPeriod] = useState<"1M" | "3M" | "6M" | "1Y">("3M");
+  const [riskPortfolios, setRiskPortfolios] = useState<PortfolioOption[]>([]);
+  const [riskPortfolioId, setRiskPortfolioId] = useState("");
+  const [riskPortfolioError, setRiskPortfolioError] = useState("");
+  const [riskAssessment, setRiskAssessment] = useState<RiskMeterResponse | null>(null);
+  const [riskMeterLoading, setRiskMeterLoading] = useState(false);
+  const [riskMeterError, setRiskMeterError] = useState("");
+
+  useEffect(() => {
+    if (mode !== "analysis") return;
+    const controller = new AbortController();
+    fetch(`${apiBase}/portfolios`, {
+      credentials: "include",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          if (response.status === 401) return [];
+          throw new Error(`Portfolio list request failed (${response.status}).`);
+        }
+        return (await response.json()) as PortfolioOption[];
+      })
+      .then((portfolios) => {
+        if (controller.signal.aborted) return;
+        setRiskPortfolios(portfolios);
+        setRiskPortfolioError("");
+      })
+      .catch((requestError: unknown) => {
+        if (!controller.signal.aborted) {
+          setRiskPortfolioError(
+            requestError instanceof Error
+              ? requestError.message
+              : "Portfolio choices are unavailable.",
+          );
+        }
+      });
+    return () => controller.abort();
+  }, [mode]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const requestedSymbol = params.get("symbol")?.trim().toUpperCase();
+    const requestedExchange = params.get("exchange")?.toUpperCase();
+    if (
+      requestedSymbol &&
+      /^[A-Z0-9][A-Z0-9._-]{0,31}$/.test(requestedSymbol) &&
+      (requestedExchange === "NSE" || requestedExchange === "BSE")
+    ) {
+      setSymbol(requestedSymbol);
+      setExchange(requestedExchange);
+    }
+  }, []);
+
+  useEffect(() => {
+    const query = symbol.trim();
+    if (query.length < 2) {
+      setInstruments([]);
+      setSearchMessage("");
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(async () => {
+      setSearchMessage("");
+      try {
+        const params = new URLSearchParams({ query, limit: "10" });
+        const response = await fetch(
+          `${apiBase}/market-data/instruments/search?${params}`,
+          { signal: controller.signal },
+        );
+        if (!response.ok) {
+          const body = (await response.json()) as ApiError;
+          throw new Error(body.detail || `Symbol search failed (${response.status}).`);
+        }
+        const results = (await response.json()) as Instrument[];
+        setInstruments(results);
+        setSearchMessage(
+          results.length ? "" : "No matching symbols in the configured provider.",
+        );
+      } catch (requestError) {
+        if (requestError instanceof Error && requestError.name !== "AbortError") {
+          setInstruments([]);
+          setSearchMessage(requestError.message);
+        }
+      }
+    }, 250);
+
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [symbol]);
 
   async function loadChart(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const cleanSymbol = symbol.trim().toUpperCase();
-    if (!cleanSymbol) {
-      setError("Enter an instrument symbol to load its historical chart.");
+    if (!/^[A-Z0-9][A-Z0-9._-]{0,31}$/.test(cleanSymbol)) {
+      setError("Enter a valid symbol using letters, numbers, dots, underscores, or hyphens.");
+      setData(null);
+      return;
+    }
+    if (startDate && endDate && startDate > endDate) {
+      setError("The start date must be on or before the end date.");
+      setData(null);
       return;
     }
     setLoading(true);
     setError("");
     setData(null);
     setHoverIndex(null);
+    setVisibleBars(2000);
 
     const query = new URLSearchParams();
     if (startDate) query.set("start", startDate);
@@ -104,9 +290,12 @@ export function HistoricalChart() {
         candles: Candle[];
         data_status: string;
         source: string;
+        freshness_status: string;
+        data_as_of: string | null;
       };
       const indicators = (await indicatorResponse.json()) as {
         indicators: Record<string, (number | null)[]>;
+        performance: ChartData["performance"];
       };
       const patterns = (await patternResponse.json()) as { patterns: Pattern[] };
       setData({
@@ -115,6 +304,9 @@ export function HistoricalChart() {
         patterns: patterns.patterns,
         source: candles.source,
         dataStatus: candles.data_status,
+        freshnessStatus: candles.freshness_status,
+        dataAsOf: candles.data_as_of,
+        performance: indicators.performance,
       });
     } catch (requestError) {
       setError(
@@ -127,48 +319,154 @@ export function HistoricalChart() {
     }
   }
 
+  async function requestResearch() {
+    const cleanSymbol = symbol.trim().toUpperCase();
+    if (!/^[A-Z0-9][A-Z0-9._-]{0,31}$/.test(cleanSymbol)) {
+      setResearch(null);
+      setResearchError("Enter a valid symbol before requesting research.");
+      return;
+    }
+    setResearch(null);
+    setResearchError("");
+    setResearchLoading(true);
+    try {
+      const response = await fetch(`${apiBase}/research`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: cleanSymbol,
+          exchange,
+          period: researchPeriod,
+        }),
+      });
+      const payload = (await response.json()) as ResearchResult | ApiError;
+      if (!response.ok) {
+        throw new Error(
+          "detail" in payload && payload.detail
+            ? payload.detail
+            : `Research request failed (${response.status}).`,
+        );
+      }
+      if (!("data" in payload) || !("ai" in payload)) {
+        throw new Error("The research service returned an invalid response.");
+      }
+      setResearch(payload);
+    } catch (requestError) {
+      setResearchError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Unable to load financial research.",
+      );
+    } finally {
+      setResearchLoading(false);
+    }
+  }
+
+  async function requestRiskMeter(includeAIExplanation = false) {
+    const cleanSymbol = symbol.trim().toUpperCase();
+    if (!/^[A-Z0-9][A-Z0-9._-]{0,31}$/.test(cleanSymbol)) {
+      setRiskAssessment(null);
+      setRiskMeterError("Enter a valid symbol before calculating the risk meter.");
+      return;
+    }
+    setRiskMeterLoading(true);
+    setRiskMeterError("");
+    try {
+      const response = await fetch(`${apiBase}/risk-meter`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: cleanSymbol,
+          exchange,
+          period: riskPeriod,
+          ...(riskPortfolioId ? { portfolio_id: riskPortfolioId } : {}),
+          include_ai_explanation: includeAIExplanation,
+        }),
+      });
+      const payload = (await response.json()) as RiskMeterResponse | ApiError;
+      if (!response.ok) {
+        throw new Error(
+          "detail" in payload && payload.detail
+            ? payload.detail
+            : `Risk meter request failed (${response.status}).`,
+        );
+      }
+      setRiskAssessment(payload as RiskMeterResponse);
+    } catch (requestError) {
+      setRiskMeterError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Risk assessment could not be calculated.",
+      );
+    } finally {
+      setRiskMeterLoading(false);
+    }
+  }
+
   const candles = data?.candles ?? [];
-  const lows = candles.map((candle) => candle.low);
-  const highs = candles.map((candle) => candle.high);
+  const firstVisibleIndex = Math.max(0, candles.length - visibleBars);
+  const chartCandles = candles.slice(firstVisibleIndex);
+  const chartIndicators: Record<string, (number | null)[]> = Object.fromEntries(
+    Object.entries(data?.indicators ?? {}).map(([name, values]) => [
+      name,
+      values.slice(firstVisibleIndex),
+    ]),
+  );
+  const lows = chartCandles.map((candle) => candle.low);
+  const highs = chartCandles.map((candle) => candle.high);
   const minimum = lows.length ? Math.min(...lows) : 0;
   const maximum = highs.length ? Math.max(...highs) : 1;
   const padding = (maximum - minimum) * 0.08 || maximum * 0.03;
   const priceMin = minimum - padding;
   const priceMax = maximum + padding;
   const plotWidth = SVG_WIDTH - 44;
-  const xFor = (index: number) => 36 + ((index + 0.5) / Math.max(candles.length, 1)) * plotWidth;
+  const xFor = (index: number) => 36 + ((index + 0.5) / Math.max(chartCandles.length, 1)) * plotWidth;
   const yForPrice = (value: number) =>
     12 + ((priceMax - value) / Math.max(priceMax - priceMin, Number.EPSILON)) * PRICE_HEIGHT;
-  const maxVolume = Math.max(...candles.map((candle) => candle.volume), 1);
+  const maxVolume = Math.max(...chartCandles.map((candle) => candle.volume), 1);
   const rsi = data?.indicators.rsi ?? [];
   const macd = data?.indicators.macd ?? [];
   const macdSignal = data?.indicators.macd_signal ?? [];
+  const chartRsi = chartIndicators.rsi ?? [];
+  const chartMacd = chartIndicators.macd ?? [];
+  const chartMacdSignal = chartIndicators.macd_signal ?? [];
   const macdValues = [...macd, ...macdSignal].filter(
     (value): value is number => value !== null,
   );
   const macdMinimum = macdValues.length ? Math.min(...macdValues) : -1;
   const macdMaximum = macdValues.length ? Math.max(...macdValues) : 1;
   const macdRange = Math.max(macdMaximum - macdMinimum, Number.EPSILON);
+  const patternCandleIndices = new Set(
+    (data?.patterns ?? [])
+      .map((pattern) =>
+        chartCandles.findIndex(
+          (candle) => formatDate(candle.timestamp) === formatDate(pattern.detection_time),
+        ),
+      )
+      .filter((index) => index >= 0),
+  );
 
   function hover(event: PointerEvent<SVGSVGElement>) {
-    if (!candles.length || !chartRef.current) return;
+    if (!chartCandles.length || !chartRef.current) return;
     const rect = chartRef.current.getBoundingClientRect();
     const x = ((event.clientX - rect.left) / rect.width) * SVG_WIDTH;
-    const index = Math.floor(((x - 36) / plotWidth) * candles.length);
-    setHoverIndex(index >= 0 && index < candles.length ? index : null);
+    const index = Math.floor(((x - 36) / plotWidth) * chartCandles.length);
+    setHoverIndex(index >= 0 && index < chartCandles.length ? index : null);
   }
 
   function indicatorValues(index: number | null) {
     if (index === null || !data) return null;
     return {
-      sma: data.indicators.sma[index],
-      ema: data.indicators.ema[index],
-      rsi: data.indicators.rsi[index],
-      macd: data.indicators.macd[index],
+      sma: chartIndicators.sma?.[index] ?? null,
+      ema: chartIndicators.ema?.[index] ?? null,
+      rsi: chartIndicators.rsi?.[index] ?? null,
+      macd: chartIndicators.macd?.[index] ?? null,
     };
   }
 
-  const hovered = hoverIndex === null ? null : candles[hoverIndex];
+  const hovered = hoverIndex === null ? null : chartCandles[hoverIndex];
   const hoveredIndicators = indicatorValues(hoverIndex);
 
   return (
@@ -179,15 +477,51 @@ export function HistoricalChart() {
             <span>Symbol</span>
             <input
               autoCapitalize="characters"
+              aria-autocomplete="list"
+              list="market-instrument-suggestions"
               maxLength={32}
-              onChange={(event) => setSymbol(event.target.value)}
+              onChange={(event) => {
+                const selected = instruments.find(
+                  (instrument) =>
+                    instrument.symbol === event.target.value.trim().toUpperCase(),
+                );
+                if (selected) setExchange(selected.exchange);
+                setResearch(null);
+                setResearchError("");
+                setRiskAssessment(null);
+                setRiskMeterError("");
+                setSymbol(event.target.value);
+              }}
               placeholder="e.g. RELIANCE"
               value={symbol}
             />
+            <datalist id="market-instrument-suggestions">
+              {instruments.map((instrument) => (
+                <option
+                  key={`${instrument.exchange}:${instrument.symbol}`}
+                  value={instrument.symbol}
+                  label={`${instrument.exchange} · ${instrument.name}`}
+                />
+              ))}
+            </datalist>
+            {searchMessage && (
+              <small className="symbol-search-message" role="status">
+                {searchMessage}
+              </small>
+            )}
           </label>
           <label className="field">
             <span>Exchange</span>
-            <select onChange={(event) => setExchange(event.target.value)} value={exchange}>
+            <select
+              onChange={(event) => {
+                setResearch(null);
+                setResearchError("");
+                setRiskAssessment(null);
+                setRiskMeterError("");
+                setExchange(event.target.value);
+              }}
+              value={exchange}
+            >
               <option value="NSE">NSE</option>
               <option value="BSE">BSE</option>
             </select>
@@ -205,7 +539,7 @@ export function HistoricalChart() {
           </button>
         </form>
         <p className="data-provenance">
-          Daily candles only. The chart displays historical user-supplied CSV data; it is not a live feed.
+          Daily historical candles only; no live quotes. Data source and freshness are reported with the chart.
         </p>
       </section>
 
@@ -213,19 +547,111 @@ export function HistoricalChart() {
         <section className="section-card error-state" role="alert">
           <strong>Historical data unavailable</strong>
           <p>{error}</p>
-          <p>Configure a permitted CSV source in the API environment and retry.</p>
+          <p>Configure a supported historical-data provider in the API environment and retry.</p>
+        </section>
+      )}
+
+      {mode === "analysis" && data && candles.length > 0 && (
+        <section className="section-card stock-overview" aria-label={`${exchange}:${symbol.toUpperCase()} stock overview`}>
+          <div className="section-heading compact">
+            <div>
+              <p className="eyebrow">SELECTED INSTRUMENT</p>
+              <h2>{exchange}:{symbol.toUpperCase()} overview</h2>
+            </div>
+            <span className="demo-tag historical-tag">Historical daily data · not a live quote</span>
+          </div>
+          <div className="analysis-metrics">
+            <div><strong>Latest daily close</strong><span>{candles.at(-1)?.close.toFixed(2) ?? "Unavailable"}</span></div>
+            <div><strong>Period return</strong><span>{data.performance.period_return_percent === null ? "Insufficient history" : `${data.performance.period_return_percent.toFixed(2)}%`}</span></div>
+            <div>
+              <strong>Annualized volatility</strong>
+              <span>{data.performance.annualized_volatility_percent === null ? "Insufficient history" : `${data.performance.annualized_volatility_percent.toFixed(2)}%`}</span>
+              <small>{data.performance.daily_return_observations} daily returns</small>
+            </div>
+            {[
+              ["SMA 20", data.indicators.sma?.at(-1)],
+              ["EMA 20", data.indicators.ema?.at(-1)],
+              ["RSI 14", data.indicators.rsi?.at(-1)],
+              ["MACD", data.indicators.macd?.at(-1)],
+            ].map(([label, value]) => (
+              <div key={String(label)}>
+                <strong>{label}</strong>
+                <span>{typeof value === "number" ? value.toFixed(2) : "Insufficient history"}</span>
+              </div>
+            ))}
+          </div>
+          <p className="data-provenance">{data.performance.method} Returns and volatility are descriptive historical calculations, not a forecast or recommendation.</p>
         </section>
       )}
 
       {data && candles.length > 0 ? (
-        <section className="section-card chart-card">
+        <section className={`section-card chart-card ${mode === "chart" ? "chart-workspace" : ""}`}>
           <div className="section-heading compact">
             <div>
               <p className="eyebrow">{exchange} · {symbol.toUpperCase()} · DAILY</p>
               <h2>Candlestick chart</h2>
             </div>
-            <span className="demo-tag historical-tag">{data.dataStatus}</span>
+            <span className="demo-tag historical-tag">
+              {data.dataStatus} · {data.freshnessStatus.replaceAll("_", " ")}
+            </span>
           </div>
+          <p className="data-provenance">
+            {data.source} · Latest bar as of{" "}
+            {data.dataAsOf ? formatTimestamp(data.dataAsOf) : "unknown"} · Historical data, not live.
+          </p>
+          {data.freshnessStatus === "STALE_HISTORY" && (
+            <p className="provider-warning" role="status">
+              Warning: this historical data is stale. Its latest bar is older than the recent-history window.
+            </p>
+          )}
+          {data.freshnessStatus === "UNKNOWN" && (
+            <p className="provider-warning" role="status">
+              The freshness of this historical data could not be determined.
+            </p>
+          )}
+          {mode === "analysis" && (
+            <p className="data-provenance">{data.performance.method} Descriptive history, not a forecast or recommendation.</p>
+          )}
+          {mode === "chart" && (
+            <div className="chart-zoom-controls" role="group" aria-label="Chart zoom controls">
+              <span>Showing {chartCandles.length} of {candles.length} daily bars</span>
+              <button
+                className="secondary-button"
+                disabled={chartCandles.length <= 20}
+                onClick={() => {
+                  setVisibleBars((current) =>
+                    Math.max(20, Math.floor(Math.min(current, candles.length) / 2)),
+                  );
+                  setHoverIndex(null);
+                }}
+                type="button"
+              >
+                Zoom in
+              </button>
+              <button
+                className="secondary-button"
+                disabled={chartCandles.length >= candles.length}
+                onClick={() => {
+                  setVisibleBars((current) => Math.min(candles.length, current * 2));
+                  setHoverIndex(null);
+                }}
+                type="button"
+              >
+                Zoom out
+              </button>
+              <button
+                className="secondary-button"
+                disabled={chartCandles.length >= candles.length}
+                onClick={() => {
+                  setVisibleBars(Math.max(candles.length, 1));
+                  setHoverIndex(null);
+                }}
+                type="button"
+              >
+                Show all
+              </button>
+            </div>
+          )}
           <div className="chart-toggles" aria-label="Chart indicators">
             <label><input checked={showSma} onChange={(event) => setShowSma(event.target.checked)} type="checkbox" /> SMA 20</label>
             <label><input checked={showEma} onChange={(event) => setShowEma(event.target.checked)} type="checkbox" /> EMA 20</label>
@@ -252,9 +678,9 @@ export function HistoricalChart() {
                   </g>
                 );
               })}
-              {candles.map((candle, index) => {
+              {chartCandles.map((candle, index) => {
                 const center = xFor(index);
-                const barWidth = Math.max(2, Math.min(12, plotWidth / candles.length * 0.62));
+                const barWidth = Math.max(2, Math.min(12, plotWidth / chartCandles.length * 0.62));
                 const isUp = candle.close >= candle.open;
                 const bodyTop = yForPrice(Math.max(candle.open, candle.close));
                 const bodyBottom = yForPrice(Math.min(candle.open, candle.close));
@@ -286,16 +712,35 @@ export function HistoricalChart() {
                   </g>
                 );
               })}
-              {showSma && data.indicators.sma && (
+              {mode === "chart" && data.patterns.map((pattern, patternIndex) => {
+                const candleIndex = chartCandles.findIndex(
+                  (candle) =>
+                    formatDate(candle.timestamp) === formatDate(pattern.detection_time),
+                );
+                if (candleIndex < 0) return null;
+                const candle = chartCandles[candleIndex];
+                return (
+                  <g key={`${pattern.detection_time}-${patternIndex}`}>
+                    <circle
+                      className="pattern-overlay-marker"
+                      cx={xFor(candleIndex)}
+                      cy={Math.max(10, yForPrice(candle.high) - 9)}
+                      r="4"
+                    />
+                    <title>{pattern.name} detected {formatDate(pattern.detection_time)} · rule-based pattern</title>
+                  </g>
+                );
+              })}
+              {showSma && chartIndicators.sma && (
                 <polyline
                   className="indicator-line sma-line"
-                  points={linePoints(data.indicators.sma, xFor, yForPrice)}
+                  points={linePoints(chartIndicators.sma, xFor, yForPrice)}
                 />
               )}
-              {showEma && data.indicators.ema && (
+              {showEma && chartIndicators.ema && (
                 <polyline
                   className="indicator-line ema-line"
-                  points={linePoints(data.indicators.ema, xFor, yForPrice)}
+                  points={linePoints(chartIndicators.ema, xFor, yForPrice)}
                 />
               )}
               {hoverIndex !== null && (
@@ -308,8 +753,8 @@ export function HistoricalChart() {
                 />
               )}
               <line className="chart-volume-divider" x1="36" x2={SVG_WIDTH} y1={VOLUME_TOP} y2={VOLUME_TOP} />
-              {candles.filter((_, index) => index % Math.max(1, Math.ceil(candles.length / 6)) === 0).map((candle) => {
-                const index = candles.indexOf(candle);
+              {chartCandles.filter((_, index) => index % Math.max(1, Math.ceil(chartCandles.length / 6)) === 0).map((candle) => {
+                const index = chartCandles.indexOf(candle);
                 return <text className="chart-axis-label" key={candle.timestamp} x={xFor(index)} y="347">{formatDate(candle.timestamp)}</text>;
               })}
             </svg>
@@ -319,6 +764,9 @@ export function HistoricalChart() {
             <span><i className="legend-candle down" /> Down close</span>
             {showSma && <span><i className="legend-line sma-line" /> SMA 20</span>}
             {showEma && <span><i className="legend-line ema-line" /> EMA 20</span>}
+            {mode === "chart" && patternCandleIndices.size > 0 && (
+              <span><i className="legend-pattern" /> Rule-based breakout</span>
+            )}
             <span>Volume</span>
           </div>
           {(showRsi || showMacd) && (
@@ -337,7 +785,7 @@ export function HistoricalChart() {
                     })}
                     <polyline
                       className="indicator-line rsi-line"
-                      points={linePoints(rsi, xFor, (value) => 8 + ((100 - value) / 100) * 72)}
+                      points={linePoints(chartRsi, xFor, (value) => 8 + ((100 - value) / 100) * 72)}
                     />
                   </svg>
                 </div>
@@ -359,11 +807,11 @@ export function HistoricalChart() {
                     />
                     <polyline
                       className="indicator-line macd-line"
-                      points={linePoints(macd, xFor, (value) => 8 + ((macdMaximum - value) / macdRange) * 72)}
+                      points={linePoints(chartMacd, xFor, (value) => 8 + ((macdMaximum - value) / macdRange) * 72)}
                     />
                     <polyline
                       className="indicator-line signal-line"
-                      points={linePoints(macdSignal, xFor, (value) => 8 + ((macdMaximum - value) / macdRange) * 72)}
+                      points={linePoints(chartMacdSignal, xFor, (value) => 8 + ((macdMaximum - value) / macdRange) * 72)}
                     />
                   </svg>
                 </div>
@@ -404,9 +852,15 @@ export function HistoricalChart() {
           <p className="table-footnote">{data.source}. Candles are not exchange-verified.</p>
         </section>
       ) : data ? (
-        <section className="section-card empty-state">
-          <strong>No daily candles in the selected range</strong>
-          <p>Adjust the symbol or historical date range.</p>
+        <section className="section-card empty-state" role="status">
+          <strong>No historical candles found</strong>
+          <p>
+            {data.source} returned no daily history for {exchange}:{symbol.toUpperCase()}
+            {startDate || endDate
+              ? ` in the selected date range${startDate ? ` from ${startDate}` : ""}${endDate ? ` through ${endDate}` : ""}.`
+              : "."}
+          </p>
+          <p>Historical data only; no live quote is available.</p>
         </section>
       ) : (
         <section className="section-card empty-state">
@@ -416,7 +870,220 @@ export function HistoricalChart() {
         </section>
       )}
 
-      {data && (
+      {mode === "analysis" && (
+        <section className="section-card risk-meter-panel" aria-labelledby="risk-meter-heading">
+          <div className="section-heading compact">
+            <div>
+              <p className="eyebrow">DETERMINISTIC INDICATOR SCORE</p>
+              <h2 id="risk-meter-heading">Explainable risk-based meter</h2>
+              <p className="muted">Informational historical assessment only; this never places or recommends an automatic trade.</p>
+            </div>
+            <span className="demo-tag">NOT FINANCIAL ADVICE</span>
+          </div>
+          <div className="research-request">
+            <label className="field">
+              <span>Scoring period</span>
+              <select onChange={(event) => {
+                setRiskPeriod(event.target.value as "1M" | "3M" | "6M" | "1Y");
+                setRiskAssessment(null);
+              }} value={riskPeriod}>
+                <option value="1M">1 month</option>
+                <option value="3M">3 months</option>
+                <option value="6M">6 months</option>
+                <option value="1Y">1 year</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Optional portfolio risk context</span>
+              <select onChange={(event) => {
+                setRiskPortfolioId(event.target.value);
+                setRiskAssessment(null);
+              }} value={riskPortfolioId}>
+                <option value="">No portfolio context</option>
+                {riskPortfolios.map((portfolio) => (
+                  <option key={portfolio.id} value={portfolio.id}>{portfolio.name}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="primary-button"
+              disabled={riskMeterLoading || !symbol.trim()}
+              onClick={() => void requestRiskMeter()}
+              type="button"
+            >
+              {riskMeterLoading ? "Calculating…" : "Calculate risk meter"}
+            </button>
+          </div>
+          {riskPortfolioError && <p className="muted" role="status">{riskPortfolioError}</p>}
+          {riskMeterLoading && <p role="status">Calculating from validated daily historical data…</p>}
+          {riskMeterError && (
+            <div className="notice news-notice" role="alert">
+              <strong>Risk assessment unavailable</strong>
+              <p>{riskMeterError}</p>
+              {riskMeterError.toLowerCase().includes("authentication") && (
+                <a className="text-link" href="/login">Sign in to calculate this assessment.</a>
+              )}
+            </div>
+          )}
+          {riskAssessment && (
+            <RiskMeterReport
+              assessment={riskAssessment}
+              explanationLoading={riskMeterLoading}
+              onExplain={() => void requestRiskMeter(true)}
+            />
+          )}
+        </section>
+      )}
+
+      {mode === "analysis" && <section className="section-card research-panel" aria-labelledby="research-heading">
+        <div className="section-heading compact">
+          <div>
+            <p className="eyebrow">SOURCED RESEARCH</p>
+            <h2 id="research-heading">AI financial research</h2>
+            <p className="muted">
+              Authenticated research from available historical data and linked publisher articles.
+            </p>
+          </div>
+          <span className="demo-tag">NOT FINANCIAL ADVICE</span>
+        </div>
+        <div className="research-request">
+          <label className="field">
+            <span>Analysis period</span>
+            <select
+              onChange={(event) => {
+                setResearch(null);
+                setResearchError("");
+                setResearchPeriod(event.target.value);
+              }}
+              value={researchPeriod}
+            >
+              <option value="1M">1 month</option>
+              <option value="3M">3 months</option>
+              <option value="6M">6 months</option>
+              <option value="1Y">1 year</option>
+            </select>
+          </label>
+          <button
+            className="primary-button"
+            disabled={researchLoading || !symbol.trim()}
+            onClick={() => void requestResearch()}
+            type="button"
+          >
+            {researchLoading ? "Researching…" : "Generate research"}
+          </button>
+        </div>
+        {researchLoading && <p role="status">Loading historical data and available sources…</p>}
+        {researchError && (
+          <div className="notice news-notice" role="alert">
+            <strong>Research unavailable</strong>
+            <p>{researchError}</p>
+            {researchError.toLowerCase().includes("authentication") && (
+              <a className="text-link" href="/login">Sign in to request research.</a>
+            )}
+          </div>
+        )}
+        {research && (
+          <div className="research-result">
+            <div className="research-status-row" aria-label="Research source status">
+              <span>Market data: {research.data.status}</span>
+              <span>News: {research.news.status}</span>
+              <span>AI: {research.ai.status}</span>
+            </div>
+            {research.data.message && <p role="status">{research.data.message}</p>}
+            {research.news.message && <p role="status">{research.news.message}</p>}
+            {research.data.status === "HISTORICAL" && (
+              <>
+                <h3>Historical observations · {research.symbol} · {research.period}</h3>
+                <p className="data-provenance">
+                  {research.data.source} · {research.data.candle_count} daily candles · as of{" "}
+                  {research.data.data_as_of
+                    ? formatTimestamp(research.data.data_as_of)
+                    : "unknown"}{" "}
+                  · {research.data.freshness_status?.replaceAll("_", " ")} · historical, not live.
+                </p>
+                <div className="analysis-metrics">
+                  <div>
+                    <strong>Period return · calculated</strong>
+                    <span>
+                      {research.data.period_return_percent === null
+                        ? "Insufficient history"
+                        : `${research.data.period_return_percent.toFixed(2)}%`}
+                    </span>
+                  </div>
+                  <div>
+                    <strong>Annualized volatility · calculated</strong>
+                    <span>
+                      {research.data.annualized_volatility_percent === null
+                        ? "Insufficient history"
+                        : `${research.data.annualized_volatility_percent.toFixed(2)}%`}
+                    </span>
+                    <small>{research.data.daily_return_observations} available close-to-close returns</small>
+                  </div>
+                  {Object.entries(research.data.indicators).map(([name, value]) => (
+                    <div key={name}>
+                      <strong>{name.replaceAll("_", " ").toUpperCase()} · calculated</strong>
+                      <span>{value === null ? "Insufficient history" : value.toFixed(2)}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            <div className="research-ai">
+              <h3>AI-generated explanation</h3>
+              {research.ai.status === "AVAILABLE" && research.ai.summary ? (
+                <p>{research.ai.summary}</p>
+              ) : (
+                <p role="status">
+                  {research.ai.message ?? "No AI-generated explanation is available."}
+                </p>
+              )}
+              <small>AI text is explanatory and may be wrong; verify it against the sources below.</small>
+            </div>
+            {research.news.articles.length > 0 && (
+              <div>
+                <h3>Publisher sources</h3>
+                <ol className="research-article-list">
+                  {research.news.articles.map((article, index) => (
+                    <li key={article.source_id}>
+                      <a href={article.url} rel="noreferrer" target="_blank">
+                        [{index + 1}] {article.headline}
+                      </a>
+                      <span>{article.source} · {formatTimestamp(article.published_at)}</span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+            {research.source_references.length > 0 && (
+              <div>
+                <h3>Source references</h3>
+                <ul className="research-article-list">
+                  {research.source_references.map((source, index) => (
+                    <li key={`${source.kind}-${source.title}-${index}`}>
+                      {source.url ? (
+                        <a href={source.url} rel="noreferrer" target="_blank">{source.title}</a>
+                      ) : (
+                        <span>{source.title}</span>
+                      )}
+                      <span>{source.source}{source.as_of ? ` · ${formatTimestamp(source.as_of)}` : ""}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <div>
+              <h3>Risk considerations and limitations</h3>
+              <ul className="research-limitations">
+                {[...research.risk_considerations, ...research.limitations].map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+      </section>}
+
+      {mode === "analysis" && data && (
         <section className="section-card">
           <div className="section-heading compact">
             <div><p className="eyebrow">RULE-BASED</p><h2>Range breakout patterns</h2></div>

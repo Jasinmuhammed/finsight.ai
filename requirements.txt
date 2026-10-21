@@ -8,3 +8,4 @@ alembic>=1.14,<2
 pwdlib[argon2]>=0.2,<1
 psycopg[binary]>=3.2,<4
 python-dotenv>=1.0,<2
+yfinance>=1.2,<2

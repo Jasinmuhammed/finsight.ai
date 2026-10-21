@@ -1,4 +1,3 @@
-import { Screener } from "@/components/screener";
 import { AdvancedScreener } from "@/components/advanced-screener";
 
 export default function ScreenerPage() {
@@ -9,11 +8,10 @@ export default function ScreenerPage() {
           <p className="eyebrow">DISCOVER</p>
           <h1>Stock screener</h1>
           <p className="muted">
-            Explore the development dataset with explainable filters.
+            Filter supported instruments using validated daily historical data.
           </p>
         </div>
       </section>
-      <Screener />
       <AdvancedScreener />
     </div>
   );

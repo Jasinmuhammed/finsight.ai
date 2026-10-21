@@ -34,15 +34,22 @@ export function AuthForm({ mode }: AuthFormProps) {
 
     setSubmitting(true);
     try {
-      const response = await fetch(
-        `${apiBase}/auth/${isRegistration ? "register" : "login"}`,
-        {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email, password }),
-        },
-      );
+      let response: Response;
+      try {
+        response = await fetch(
+          `${apiBase}/auth/${isRegistration ? "register" : "login"}`,
+          {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email, password }),
+          },
+        );
+      } catch {
+        throw new Error(
+          "Unable to connect to the API. Check that the API is running and try again.",
+        );
+      }
       if (!response.ok) {
         const body = (await response.json()) as ApiError;
         const detail = Array.isArray(body.detail)
@@ -55,7 +62,7 @@ export function AuthForm({ mode }: AuthFormProps) {
     } catch (submitError) {
       setError(
         submitError instanceof Error
-          ? `${submitError.message} Check that the API is running and try again.`
+          ? submitError.message
           : "Unable to sign in right now.",
       );
     } finally {

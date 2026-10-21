@@ -178,9 +178,11 @@ export function WatchlistsWorkspace() {
         <div>
           <strong>Historical data only</strong>
           <p>
-            Alerts evaluate newly timestamped daily CSV bars no more than four days
-            old. They are not live-price notifications. Configure a CSV provider
-            and the API polling interval for scheduled evaluation.
+            Alerts evaluate newly timestamped daily historical bars no more than
+            four days old. They are not live-price notifications. Scheduled
+            checks run in the API process only when its polling interval is
+            enabled; a single API process is recommended. No email or push
+            notification is delivered.
           </p>
         </div>
       </div>

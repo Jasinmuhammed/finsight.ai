@@ -1,12 +1,15 @@
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+import logging
 import os
+import threading
+import time
 from typing import AsyncIterator, Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -37,8 +40,10 @@ from backend.portfolio import (
 from backend.market_data import (
     HistoricalCandles,
     InstrumentMetadata,
+    MARKET_TIMEZONE,
     ProviderUnavailable,
     get_market_data_provider,
+    historical_freshness,
 )
 from backend.backtesting import BacktestResult, StrategyConfig, run_backtest
 from backend.screener import (
@@ -47,16 +52,28 @@ from backend.screener import (
     screen_historical_instruments,
 )
 from backend.analytics import (
+    HistoricalPerformance,
     PatternDetection,
     calculate_indicators,
+    calculate_historical_performance,
     detect_range_breakouts,
 )
 from backend.news import (
     NewsServiceError,
     NewsServiceUnavailable,
+    explain_risk_meter_with_gemini,
     fetch_financial_news,
+    summarize_research_with_gemini,
     summarize_news_with_gemini,
 )
+from backend.risk_meter import (
+    RiskMeterPortfolioContext,
+    RiskMeterResponse,
+    apply_ai_explanation,
+    build_risk_meter,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class Instrument(BaseModel):
@@ -124,9 +141,11 @@ class IndicatorResponse(BaseModel):
     exchange: Literal["NSE", "BSE"]
     timeframe: Literal["1d"]
     data_status: Literal["HISTORICAL"]
+    freshness_status: Literal["RECENT_HISTORY", "STALE_HISTORY", "UNKNOWN"]
     source: str
     data_as_of: datetime | None
     indicators: dict[str, list[float | None]]
+    performance: HistoricalPerformance
 
 
 class PatternResponse(BaseModel):
@@ -134,7 +153,9 @@ class PatternResponse(BaseModel):
     exchange: Literal["NSE", "BSE"]
     timeframe: Literal["1d"]
     data_status: Literal["HISTORICAL"]
+    freshness_status: Literal["RECENT_HISTORY", "STALE_HISTORY", "UNKNOWN"]
     source: str
+    data_as_of: datetime | None
     patterns: list[PatternDetection]
 
 
@@ -154,6 +175,80 @@ class NewsResponse(BaseModel):
     articles: list[NewsArticleResponse]
     ai_status: Literal["NOT_REQUESTED", "NO_ARTICLES", "UNAVAILABLE", "AVAILABLE"]
     ai_summary: str | None
+
+
+class ResearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1, max_length=32)
+    exchange: Literal["NSE", "BSE"]
+    period: Literal["1M", "3M", "6M", "1Y"] = "3M"
+
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, value: str) -> str:
+        return InstrumentMetadata(symbol=value, exchange="NSE", name=value).symbol
+
+
+class RiskMeterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1, max_length=32)
+    exchange: Literal["NSE", "BSE"]
+    period: Literal["1M", "3M", "6M", "1Y"] = "3M"
+    portfolio_id: UUID | None = None
+    include_ai_explanation: bool = False
+
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, value: str) -> str:
+        return InstrumentMetadata(symbol=value, exchange="NSE", name=value).symbol
+
+
+class ResearchSourceReference(BaseModel):
+    kind: Literal["HISTORICAL_DATA", "NEWS"]
+    source: str
+    title: str
+    url: str | None = None
+    as_of: datetime | None = None
+
+
+class ResearchDataResponse(BaseModel):
+    status: Literal["HISTORICAL", "UNAVAILABLE", "ERROR"]
+    source: str | None
+    freshness_status: Literal["RECENT_HISTORY", "STALE_HISTORY", "UNKNOWN"] | None
+    data_as_of: datetime | None
+    candle_count: int
+    period_return_percent: float | None
+    annualized_volatility_percent: float | None
+    daily_return_observations: int
+    indicators: dict[str, float | None]
+    message: str | None
+
+
+class ResearchNewsResponse(BaseModel):
+    status: Literal["AVAILABLE", "NO_ARTICLES", "UNAVAILABLE", "ERROR"]
+    source: str | None
+    articles: list[NewsArticleResponse]
+    message: str | None
+
+
+class ResearchAIResponse(BaseModel):
+    status: Literal["AVAILABLE", "NOT_CONFIGURED", "NO_SOURCES", "ERROR"]
+    summary: str | None
+    message: str | None
+
+
+class ResearchResponse(BaseModel):
+    symbol: str
+    exchange: Literal["NSE", "BSE"]
+    period: Literal["1M", "3M", "6M", "1Y"]
+    data: ResearchDataResponse
+    news: ResearchNewsResponse
+    ai: ResearchAIResponse
+    risk_considerations: list[str]
+    source_references: list[ResearchSourceReference]
+    limitations: list[str]
 
 
 class CreateWatchlistRequest(BaseModel):
@@ -267,24 +362,32 @@ class HoldingResponse(BaseModel):
     exchange: Literal["NSE", "BSE"]
     quantity: float
     average_cost: float
+    invested_amount: float
     historical_last_close: float | None
     market_value: float | None
     realized_pnl: float
     unrealized_pnl: float | None
     allocation_percent: float | None
     price_status: Literal["HISTORICAL", "UNAVAILABLE"]
+    price_message: str | None
     price_as_of: datetime | None
+    freshness_status: Literal["RECENT_HISTORY", "STALE_HISTORY", "UNKNOWN"]
 
 
 class PortfolioOverviewResponse(BaseModel):
     portfolio_id: str
     initial_cash: float
     cash_balance: float
+    total_invested_capital: float
     cash_allocation_percent: float | None
     total_value: float | None
     realized_pnl: float
     unrealized_pnl: float | None
     valuation_status: Literal["HISTORICAL", "PARTIAL", "UNAVAILABLE", "CASH_ONLY"]
+    price_source: str
+    freshness_status: Literal[
+        "RECENT_HISTORY", "STALE_HISTORY", "MIXED_HISTORY", "UNKNOWN"
+    ]
     data_as_of: datetime | None
     holdings: list[HoldingResponse]
     risk: PortfolioRisk
@@ -446,13 +549,18 @@ def financial_news(
 ) -> NewsResponse:
     try:
         articles = fetch_financial_news(limit=limit, symbol=symbol)
-        summary = summarize_news_with_gemini(articles) if summarize_ai else None
     except NewsServiceUnavailable as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except NewsServiceError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
+    summary = None
+    if summarize_ai and articles:
+        try:
+            summary = summarize_news_with_gemini(articles)
+        except NewsServiceError as error:
+            logger.warning("Gemini news summary unavailable: %s", error)
     return NewsResponse(
         data_status="NEWS",
         source="Finnhub",
@@ -467,6 +575,222 @@ def financial_news(
             else "UNAVAILABLE"
         ),
         ai_summary=summary,
+    )
+
+
+RESEARCH_RATE_WINDOW_SECONDS = 60
+RESEARCH_RATE_LIMIT = 5
+research_attempts: dict[str, list[float]] = {}
+research_attempts_lock = threading.Lock()
+
+
+def _check_research_rate_limit(user: User) -> None:
+    now = time.monotonic()
+    with research_attempts_lock:
+        for user_id in list(research_attempts):
+            recent = [
+                stamp
+                for stamp in research_attempts[user_id]
+                if now - stamp < RESEARCH_RATE_WINDOW_SECONDS
+            ]
+            if recent:
+                research_attempts[user_id] = recent
+            else:
+                research_attempts.pop(user_id, None)
+        recent = research_attempts.get(user.id, [])
+        if len(recent) >= RESEARCH_RATE_LIMIT:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Research request limit reached. Try again shortly.",
+                headers={"Retry-After": str(RESEARCH_RATE_WINDOW_SECONDS)},
+            )
+        recent.append(now)
+        research_attempts[user.id] = recent
+
+
+@app.post(
+    "/api/v1/research",
+    response_model=ResearchResponse,
+    dependencies=[Depends(verify_request_origin)],
+)
+def financial_research(
+    payload: ResearchRequest,
+    user: User = Depends(get_current_user),
+) -> ResearchResponse:
+    _check_research_rate_limit(user)
+    today = datetime.now(MARKET_TIMEZONE).date()
+    period_days = {"1M": 30, "3M": 90, "6M": 180, "1Y": 365}[payload.period]
+    start = today - timedelta(days=period_days)
+    provider = get_market_data_provider()
+    candles = []
+    data_status: Literal["HISTORICAL", "UNAVAILABLE", "ERROR"] = "UNAVAILABLE"
+    data_message: str | None = None
+    try:
+        candles = provider.historical_daily_candles(
+            payload.symbol, payload.exchange, start, today
+        )[-500:]
+        data_status = "HISTORICAL" if candles else "UNAVAILABLE"
+        if not candles:
+            data_message = "No historical candles were returned for this symbol and period."
+    except ProviderUnavailable as error:
+        data_status = (
+            "UNAVAILABLE" if provider.status().get("configured") is False else "ERROR"
+        )
+        data_message = str(error)
+    except ValueError as error:
+        data_status = "ERROR"
+        data_message = str(error)
+
+    performance = calculate_historical_performance(candles)
+    calculated = calculate_indicators(candles)
+
+    def latest_value(name: str) -> float | None:
+        return next(
+            (value for value in reversed(calculated[name]) if value is not None),
+            None,
+        )
+
+    data_as_of = candles[-1].timestamp if candles else None
+    data = ResearchDataResponse(
+        status=data_status,
+        source=provider.source_label if candles else None,
+        freshness_status=(
+            historical_freshness(data_as_of) if candles else None
+        ),
+        data_as_of=data_as_of,
+        candle_count=len(candles),
+        period_return_percent=performance.period_return_percent,
+        annualized_volatility_percent=performance.annualized_volatility_percent,
+        daily_return_observations=performance.daily_return_observations,
+        indicators={
+            "sma_20": latest_value("sma"),
+            "ema_20": latest_value("ema"),
+            "rsi_14": latest_value("rsi"),
+            "macd": latest_value("macd"),
+            "macd_signal": latest_value("macd_signal"),
+        },
+        message=data_message,
+    )
+
+    articles: list[dict] = []
+    news_status: Literal["AVAILABLE", "NO_ARTICLES", "UNAVAILABLE", "ERROR"]
+    news_message: str | None = None
+    try:
+        articles = fetch_financial_news(
+            limit=10, symbol=f"{payload.exchange}:{payload.symbol}"
+        )
+        news_status = "AVAILABLE" if articles else "NO_ARTICLES"
+        if not articles:
+            news_message = "The news provider returned no articles for this symbol."
+    except NewsServiceUnavailable as error:
+        news_status = "UNAVAILABLE"
+        news_message = str(error)
+    except NewsServiceError as error:
+        news_status = "ERROR"
+        news_message = str(error)
+    except ValueError as error:
+        news_status = "ERROR"
+        news_message = str(error)
+
+    references = []
+    if candles:
+        references.append(
+            ResearchSourceReference(
+                kind="HISTORICAL_DATA",
+                source=provider.source_label,
+                title=f"{payload.exchange}:{payload.symbol} daily historical candles",
+                as_of=data_as_of,
+            )
+        )
+    news_articles = [NewsArticleResponse.model_validate(article) for article in articles]
+    for index, article in enumerate(news_articles, start=1):
+        references.append(
+            ResearchSourceReference(
+                kind="NEWS",
+                source=article.source,
+                title=f"[{index}] {article.headline}",
+                url=article.url,
+                as_of=article.published_at,
+            )
+        )
+
+    has_sources = bool(candles or articles)
+    ai_status: Literal["AVAILABLE", "NOT_CONFIGURED", "NO_SOURCES", "ERROR"]
+    ai_summary: str | None = None
+    ai_message: str | None = None
+    if not has_sources:
+        ai_status = "NO_SOURCES"
+        ai_message = "No historical data or source articles are available to analyze."
+    elif not os.getenv("GEMINI_API_KEY", "").strip():
+        ai_status = "NOT_CONFIGURED"
+        ai_message = "Gemini is not configured; no AI-generated analysis was produced."
+    else:
+        research_input = {
+            "symbol": payload.symbol,
+            "exchange": payload.exchange,
+            "period": payload.period,
+            "historical_data": {
+                "status": data.status,
+                "source": data.source,
+                "freshness_status": data.freshness_status,
+                "data_as_of": data.data_as_of.isoformat() if data.data_as_of else None,
+                "candle_count": data.candle_count,
+                "period_return_percent": data.period_return_percent,
+                "annualized_volatility_percent": data.annualized_volatility_percent,
+                "indicators": data.indicators,
+                "message": data.message,
+            },
+            "news": [
+                {
+                    "source_number": index,
+                    "source": article.source,
+                    "headline": article.headline,
+                    "excerpt": article.summary[:1200],
+                    "url": article.url,
+                    "published_at": article.published_at.isoformat(),
+                }
+                for index, article in enumerate(news_articles, start=1)
+            ],
+        }
+        try:
+            ai_summary = summarize_research_with_gemini(research_input)
+            ai_status = "AVAILABLE" if ai_summary else "NOT_CONFIGURED"
+            if not ai_summary:
+                ai_message = "Gemini did not produce an analysis."
+        except NewsServiceError as error:
+            ai_status = "ERROR"
+            ai_message = str(error)
+
+    risk_considerations = [
+        "Historical returns and volatility describe the selected past period; they are not forecasts.",
+        "Daily history may be stale and may omit sessions; verify the source and as-of timestamp.",
+        "Metrics use available closes and do not account for dividends, corporate actions, taxes, or trading costs.",
+        "This research is informational and is not personalized financial advice.",
+    ]
+    if data.freshness_status == "STALE_HISTORY":
+        risk_considerations.append("The latest available historical candle is marked stale.")
+    limitations = [
+        "This workflow uses daily historical candles only; it provides no live or delayed prices.",
+        "News availability, exchange coverage, and data rights depend on the configured provider and account.",
+        "AI-generated text can be incomplete or incorrect; verify claims against the linked source data.",
+    ]
+    return ResearchResponse(
+        symbol=payload.symbol,
+        exchange=payload.exchange,
+        period=payload.period,
+        data=data,
+        news=ResearchNewsResponse(
+            status=news_status,
+            source="Finnhub" if articles else None,
+            articles=news_articles,
+            message=news_message,
+        ),
+        ai=ResearchAIResponse(
+            status=ai_status, summary=ai_summary, message=ai_message
+        ),
+        risk_considerations=risk_considerations,
+        source_references=references,
+        limitations=limitations,
     )
 
 
@@ -771,7 +1095,7 @@ def poll_user_alerts(
         skipped_alerts=result.skipped_alerts,
         data_status="HISTORICAL",
         message=(
-            "Evaluated newly timestamped user-supplied daily bars only. "
+            f"Evaluated newly timestamped daily bars from {provider.source_label}. "
             "This is not live-price monitoring."
             + (
                 f" {result.skipped_alerts} alerts were skipped because their history was unavailable or invalid."
@@ -884,7 +1208,7 @@ def search_market_instruments(
 )
 def historical_candles(
     exchange: Literal["NSE", "BSE"],
-    symbol: str,
+    symbol: str = Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"),
     start: date | None = None,
     end: date | None = None,
     limit: int = Query(default=2000, ge=1, le=5000),
@@ -903,9 +1227,12 @@ def historical_candles(
         timeframe="1d",
         candles=candles,
         data_status="HISTORICAL",
-        source="User-supplied CSV",
+        freshness_status=historical_freshness(
+            candles[-1].timestamp if candles else None
+        ),
+        source=provider.source_label,
         data_as_of=candles[-1].timestamp if candles else None,
-        provenance_note="User-supplied CSV; source provenance is not independently verified.",
+        provenance_note=provider.provenance_note,
     )
 
 
@@ -915,7 +1242,7 @@ def historical_candles(
 )
 def instrument_indicators(
     exchange: Literal["NSE", "BSE"],
-    symbol: str,
+    symbol: str = Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"),
     sma_period: int = Query(default=20, ge=1, le=252),
     ema_period: int = Query(default=20, ge=1, le=252),
     rsi_period: int = Query(default=14, ge=1, le=252),
@@ -936,11 +1263,15 @@ def instrument_indicators(
         exchange=exchange,
         timeframe="1d",
         data_status="HISTORICAL",
-        source="User-supplied CSV",
+        freshness_status=historical_freshness(
+            candles[-1].timestamp if candles else None
+        ),
+        source=provider.source_label,
         data_as_of=candles[-1].timestamp if candles else None,
         indicators=calculate_indicators(
             candles, sma_period=sma_period, ema_period=ema_period, rsi_period=rsi_period
         ),
+        performance=calculate_historical_performance(candles),
     )
 
 
@@ -950,7 +1281,7 @@ def instrument_indicators(
 )
 def instrument_patterns(
     exchange: Literal["NSE", "BSE"],
-    symbol: str,
+    symbol: str = Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"),
     lookback: int = Query(default=20, ge=2, le=252),
     volume_multiplier: float = Query(default=1.5, gt=0, le=100),
     start: date | None = None,
@@ -970,7 +1301,11 @@ def instrument_patterns(
         exchange=exchange,
         timeframe="1d",
         data_status="HISTORICAL",
-        source="User-supplied CSV",
+        freshness_status=historical_freshness(
+            candles[-1].timestamp if candles else None
+        ),
+        source=provider.source_label,
+        data_as_of=candles[-1].timestamp if candles else None,
         patterns=detect_range_breakouts(
             candles, lookback=lookback, volume_multiplier=volume_multiplier
         ),
@@ -1038,7 +1373,7 @@ def run_historical_backtest(
         id=run.id,
         symbol=payload.symbol.upper(),
         exchange=payload.exchange,
-        source="User-supplied CSV",
+        source=provider.source_label,
         result=result,
     )
 
@@ -1353,6 +1688,7 @@ def portfolio_overview(
     data_dates = []
     unavailable_count = 0
     total_market_value = 0.0
+    total_invested_capital = 0.0
     total_unrealized = 0.0
     for instrument_key, state in ledger.holdings.items():
         if state.quantity <= 0:
@@ -1369,14 +1705,19 @@ def portfolio_overview(
                 status_code=409,
                 detail=f"Instrument metadata missing for portfolio holding {instrument_key}.",
             )
+        total_invested_capital += float(state.cost_basis)
         last_price = None
         price_as_of = None
+        price_message = None
         try:
             candles = provider.historical_daily_candles(
                 instrument.symbol, instrument.exchange, None, None
             )
         except ProviderUnavailable:
             candles = []
+            price_message = (
+                "The configured historical provider failed; valuation is unavailable."
+            )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         candles = candles[-5000:]
@@ -1396,19 +1737,24 @@ def portfolio_overview(
             unavailable_count += 1
             market_value = None
             unrealized = None
+            if price_message is None:
+                price_message = "No historical candles are available for valuation."
         holdings.append(
             HoldingResponse(
                 symbol=instrument.symbol,
                 exchange=instrument.exchange,
                 quantity=float(state.quantity),
                 average_cost=float(state.average_cost),
+                invested_amount=float(state.cost_basis),
                 historical_last_close=last_price,
                 market_value=market_value,
                 realized_pnl=float(state.realized_pnl),
                 unrealized_pnl=unrealized,
                 allocation_percent=None,
                 price_status="HISTORICAL" if last_price is not None else "UNAVAILABLE",
+                price_message=price_message,
                 price_as_of=price_as_of,
+                freshness_status=historical_freshness(price_as_of),
             )
         )
 
@@ -1435,10 +1781,23 @@ def portfolio_overview(
             if holding.market_value is not None:
                 holding.allocation_percent = holding.market_value / total_value * 100
     risk = calculate_portfolio_risk(history, weights)
+    freshness_states = {
+        holding.freshness_status
+        for holding in holdings
+        if holding.price_status == "HISTORICAL"
+    }
+    freshness_status = (
+        "UNKNOWN"
+        if not freshness_states
+        else next(iter(freshness_states))
+        if len(freshness_states) == 1
+        else "MIXED_HISTORY"
+    )
     return PortfolioOverviewResponse(
         portfolio_id=portfolio.id,
         initial_cash=float(portfolio.initial_cash),
         cash_balance=float(ledger.cash_balance),
+        total_invested_capital=total_invested_capital,
         cash_allocation_percent=(
             float(ledger.cash_balance) / total_value * 100
             if total_value is not None and total_value > 0
@@ -1448,10 +1807,114 @@ def portfolio_overview(
         realized_pnl=float(ledger.realized_pnl),
         unrealized_pnl=unrealized_total,
         valuation_status=valuation_status,
+        price_source=provider.source_label,
+        freshness_status=freshness_status,
         data_as_of=max(data_dates, default=None),
         holdings=holdings,
         risk=risk,
     )
+
+
+@app.post(
+    "/api/v1/risk-meter",
+    response_model=RiskMeterResponse,
+    dependencies=[Depends(verify_request_origin)],
+)
+def risk_meter(
+    payload: RiskMeterRequest,
+    user: User = Depends(get_current_user),
+    database: Session = Depends(get_db),
+) -> RiskMeterResponse:
+    provider = get_market_data_provider()
+    provider_status = provider.status()
+    if not provider_status.get("configured", False):
+        raise HTTPException(
+            status_code=503,
+            detail="Risk assessment unavailable because no configured historical market-data provider is available.",
+        )
+
+    period_days = {"1M": 30, "3M": 90, "6M": 180, "1Y": 365}
+    end = datetime.now(MARKET_TIMEZONE).date()
+    start = end - timedelta(days=period_days[payload.period])
+    try:
+        candles = provider.historical_daily_candles(
+            payload.symbol, payload.exchange, start, end
+        )[-500:]
+    except ProviderUnavailable as error:
+        raise HTTPException(
+            status_code=502,
+            detail="Configured historical market-data provider could not supply the risk assessment.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    performance = calculate_historical_performance(candles)
+    calculated = calculate_indicators(candles)
+
+    def latest_value(name: str) -> float | None:
+        return next(
+            (value for value in reversed(calculated[name]) if value is not None),
+            None,
+        )
+
+    data_as_of = candles[-1].timestamp if candles else None
+    freshness = historical_freshness(data_as_of) if candles else None
+    portfolio_context = None
+    if payload.portfolio_id is not None:
+        overview = portfolio_overview(payload.portfolio_id, user, database)
+        holding = next(
+            (
+                item
+                for item in overview.holdings
+                if item.symbol == payload.symbol and item.exchange == payload.exchange
+            ),
+            None,
+        )
+        portfolio = _portfolio_for_user(payload.portfolio_id, user, database)
+        portfolio_context = RiskMeterPortfolioContext(
+            portfolio_name=portfolio.name,
+            allocation_percent=(
+                holding.allocation_percent if holding is not None else None
+            ),
+            annualized_volatility_percent=(
+                overview.risk.annualized_volatility_percent
+            ),
+            maximum_drawdown_percent=overview.risk.maximum_drawdown_percent,
+            data_as_of=overview.data_as_of,
+        )
+
+    assessment = build_risk_meter(
+        symbol=payload.symbol,
+        exchange=payload.exchange,
+        period=payload.period,
+        latest_close=candles[-1].close if candles else None,
+        indicators={
+            "sma_20": latest_value("sma"),
+            "ema_20": latest_value("ema"),
+            "rsi_14": latest_value("rsi"),
+            "macd": latest_value("macd"),
+            "macd_signal": latest_value("macd_signal"),
+        },
+        period_return_percent=performance.period_return_percent,
+        annualized_volatility_percent=performance.annualized_volatility_percent,
+        daily_return_observations=performance.daily_return_observations,
+        source=provider.source_label if candles else None,
+        data_as_of=data_as_of,
+        freshness_status=freshness,
+        candle_count=len(candles),
+        portfolio_context=portfolio_context,
+    )
+    if payload.include_ai_explanation:
+        if not os.getenv("GEMINI_API_KEY", "").strip():
+            return apply_ai_explanation(assessment, configured=False)
+        try:
+            explanation = explain_risk_meter_with_gemini(
+                assessment.model_dump(mode="json", exclude={"ai_explanation"})
+            )
+            return apply_ai_explanation(assessment, summary=explanation)
+        except NewsServiceError as error:
+            return apply_ai_explanation(assessment, error_message=str(error))
+    return assessment
 
 
 @app.get("/api/v1/screens", response_model=list[SavedScreenResponse])

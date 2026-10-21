@@ -131,10 +131,10 @@ export function NewsWorkspace() {
               <div className="notice news-notice" role="status">
                 <span className="notice-dot" />
                 <div>
-                  <strong>AI summary not configured</strong>
+                  <strong>AI summary unavailable</strong>
                   <p>
-                    Set GEMINI_API_KEY on the API server to enable summaries. No
-                    generated text is shown without the configured service.
+                    Gemini did not provide a summary for these articles. The
+                    source headlines remain available; no generated text is shown.
                   </p>
                 </div>
               </div>
@@ -148,9 +148,19 @@ export function NewsWorkspace() {
               <article className="section-card news-article" key={article.source_id}>
                 <div className="news-article-meta">
                   <span>{index + 1} · {article.source}</span>
-                  <time dateTime={article.published_at}>
-                    {new Date(article.published_at).toLocaleString()}
-                  </time>
+                  <span className="news-time">
+                    {Number.isFinite(Date.parse(article.published_at)) ? (
+                      <time dateTime={article.published_at}>
+                        {new Date(article.published_at).toLocaleString()}
+                      </time>
+                    ) : (
+                      <span>Publication time unavailable</span>
+                    )}
+                    {Number.isFinite(Date.parse(article.published_at)) &&
+                      Date.now() - Date.parse(article.published_at) > 7 * 86_400_000 && (
+                        <strong className="news-stale-tag">Older than 7 days</strong>
+                      )}
+                  </span>
                 </div>
                 <h2>
                   <a href={article.url} rel="noreferrer" target="_blank">

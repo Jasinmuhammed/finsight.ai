@@ -1,5 +1,6 @@
 from datetime import datetime
-from statistics import fmean
+from math import sqrt
+from statistics import fmean, stdev
 from typing import Literal
 
 from pydantic import BaseModel
@@ -28,6 +29,13 @@ class PatternDetection(BaseModel):
     limitations: list[str]
 
 
+class HistoricalPerformance(BaseModel):
+    period_return_percent: float | None
+    annualized_volatility_percent: float | None
+    daily_return_observations: int
+    method: str
+
+
 def _validate_period(period: int) -> None:
     if period < 1:
         raise ValueError("period must be at least 1")
@@ -44,6 +52,33 @@ def sma(values: list[float], period: int) -> NumericSeries:
         if index >= period - 1:
             result[index] = rolling_total / period
     return result
+
+
+def calculate_historical_performance(
+    candles: list[OHLCVCandle],
+) -> HistoricalPerformance:
+    closes = [candle.close for candle in candles]
+    period_return = (
+        (closes[-1] / closes[0] - 1) * 100 if len(closes) >= 2 else None
+    )
+    daily_returns = [
+        current / previous - 1
+        for previous, current in zip(closes, closes[1:])
+    ]
+    annualized_volatility = (
+        stdev(daily_returns) * sqrt(252) * 100
+        if len(daily_returns) >= 2
+        else None
+    )
+    return HistoricalPerformance(
+        period_return_percent=period_return,
+        annualized_volatility_percent=annualized_volatility,
+        daily_return_observations=len(daily_returns),
+        method=(
+            "Close-to-close simple returns; annualized sample standard deviation "
+            "of daily returns uses 252 trading days."
+        ),
+    )
 
 
 def ema(values: list[float], period: int) -> NumericSeries:
